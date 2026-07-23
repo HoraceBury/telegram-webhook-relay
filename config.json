@@ -2,7 +2,16 @@
   "port": 80,
   "ip": "0.0.0.0",
   "webhookPath": "/webhook",
+  "tradePath": "/trade",
   "guid": "REPLACE-WITH-A-RANDOM-GUID",
   "telegramBotToken": "REPLACE-WITH-YOUR-BOT-TOKEN",
-  "telegramChatId": "REPLACE-WITH-YOUR-CHAT-ID"
+  "telegramChatId": "REPLACE-WITH-YOUR-CHAT-ID",
+  "tradelockerEnvironment": "https://demo.tradelocker.com",
+  "tradelockerEmail": "REPLACE-WITH-TRADELOCKER-EMAIL",
+  "tradelockerPassword": "REPLACE-WITH-TRADELOCKER-PASSWORD",
+  "tradelockerServer": "REPLACE-WITH-TRADELOCKER-SERVER",
+  "tradelockerAccountId": "",
+  "tradelockerAccNum": "",
+  "tradelockerDefaultQty": 0.01
 }
+

@@ -100,9 +100,17 @@ e.g. `C:\tv-webhook\`.
   "port": 80,
   "ip": "<your-vps-ip>",
   "webhookPath": "/webhook",
+  "tradePath": "/trade",
   "guid": "REPLACE-WITH-A-RANDOM-GUID",
   "telegramBotToken": "REPLACE-WITH-YOUR-BOT-TOKEN",
-  "telegramChatId": "REPLACE-WITH-YOUR-CHAT-ID"
+  "telegramChatId": "REPLACE-WITH-YOUR-CHAT-ID",
+  "tradelockerEnvironment": "https://demo.tradelocker.com",
+  "tradelockerEmail": "REPLACE-WITH-TRADELOCKER-EMAIL",
+  "tradelockerPassword": "REPLACE-WITH-TRADELOCKER-PASSWORD",
+  "tradelockerServer": "REPLACE-WITH-TRADELOCKER-SERVER",
+  "tradelockerAccountId": "",
+  "tradelockerAccNum": "",
+  "tradelockerDefaultQty": 0.01
 }
 ```
 
@@ -122,11 +130,16 @@ e.g. `C:\tv-webhook\`.
   deliberate choice here; if you ever need to test locally on the VPS,
   use this IP rather than `localhost`, since the app won't be listening
   on the loopback address.
-- **webhookPath** — the URL path TradingView will POST to. Change it to
-  something non-guessable too if you like (e.g. `/tv-alert-8f2c`) as a
-  second layer, alongside the GUID.
+- **webhookPath** — the URL path for simple Telegram notification forwarding (default `/webhook`).
+- **tradePath** — the URL path for TradeLocker automated order placement (default `/trade`).
+- **tradelockerEnvironment** — `https://demo.tradelocker.com` or `https://live.tradelocker.com`.
+- **tradelockerEmail** — Your TradeLocker login email address.
+- **tradelockerPassword** — Your TradeLocker login password.
+- **tradelockerServer** — Broker server name (as selected during TradeLocker login).
+- **tradelockerAccountId** / **tradelockerAccNum** — (Optional) Specific account ID / account number. If left blank, the server will auto-detect your active TradeLocker account.
+- **tradelockerDefaultQty** — Default trade lot size (e.g. `0.01`) if not supplied in the webhook payload.
 
-You can edit `config.json` later (e.g. to rotate the GUID) without
+You can edit `config.json` later (e.g. to rotate the GUID or update credentials) without
 restarting the process — the server watches the file and reloads it
 automatically.
 
@@ -149,15 +162,17 @@ http://<your-vps-ip>/health
 
 This should return `OK`.
 
-## 6. Set up the TradingView alert
+## 6. Set up TradingView alerts
 
-In your TradingView alert, set the **Webhook URL** to:
+### A. Telegram Notification Relay (`/webhook`)
+
+Set the **Webhook URL** to:
 
 ```
 http://<your-vps-public-ip-or-domain>:80/webhook
 ```
 
-And set the **Message** to JSON containing your GUID plus whatever
+Set the **Message** to JSON containing your GUID plus whatever
 fields you want in the Telegram message, e.g.:
 
 ```json
@@ -170,9 +185,30 @@ fields you want in the Telegram message, e.g.:
 }
 ```
 
-Every field except `guid` gets forwarded to Telegram, formatted as
-`key: value` lines. Add/remove fields freely — the server doesn't care
-which ones are present, only that `guid` matches.
+### B. TradeLocker Order Execution (`/trade`)
+
+Set the **Webhook URL** to:
+
+```
+http://<your-vps-public-ip-or-domain>:80/trade
+```
+
+Set the **Message** to JSON containing your GUID, symbol, side/action, entry, tp, sl, and qty:
+
+```json
+{
+  "guid": "paste-the-same-guid-from-config.json",
+  "symbol": "{{ticker}}",
+  "action": "BUY",
+  "entry": "{{close}}",
+  "tp": "1.1050",
+  "sl": "1.0950",
+  "qty": 0.01,
+  "type": "market"
+}
+```
+
+The server connects to TradeLocker via API, matches the symbol to the account's tradable instruments, places the trade with the entry, TP, and SL values, and forwards an execution summary (or error alert) to your Telegram chat.
 
 ## 7. Running on port 80
 
