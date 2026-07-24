@@ -40,11 +40,17 @@ function loadConfig() {
   if (!cfg.webhookPath) cfg.webhookPath = '/webhook';
   if (!cfg.tradePath) cfg.tradePath = '/trade';
   if (!cfg.healthPath) cfg.healthPath = '/health';
+  if (cfg.riskPercentage === undefined && cfg.tradelockerRiskPercent === undefined) {
+    cfg.riskPercentage = 1;
+  } else {
+    cfg.riskPercentage = Number(cfg.riskPercentage ?? cfg.tradelockerRiskPercent ?? 1);
+  }
+  cfg.dryRun = Boolean(cfg.dryRun ?? cfg.tradelockerDryRun ?? false);
   return cfg;
 }
 
 let config = loadConfig();
-log(`Config loaded. Webhook path: ${config.webhookPath}, Trade path: ${config.tradePath}, Health path: ${config.healthPath}, port: ${config.port}`);
+log(`Config loaded. Webhook path: ${config.webhookPath}, Trade path: ${config.tradePath}, Health path: ${config.healthPath}, Risk: ${config.riskPercentage}%, Dry Run: ${config.dryRun}, port: ${config.port}`);
 
 // Reload config.json automatically if you edit it (e.g. rotate GUID or update credentials)
 fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
@@ -202,6 +208,48 @@ async function getTradeLockerAccountDetails(token) {
   return { accountId, accNum };
 }
 
+async function getTradeLockerAccountBalance(token, accountId, accNum) {
+  const baseUrl = getTradeLockerBaseUrl(config);
+  try {
+    const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/state`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'accNum': String(accNum),
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      const bal = data.d?.balance ?? data.d?.accountBalance ?? data.balance ?? data.accountBalance;
+      if (bal !== undefined && !isNaN(Number(bal))) {
+        return Number(bal);
+      }
+    }
+  } catch (_) {}
+
+  try {
+    const respAll = await fetch(`${baseUrl}/auth/jwt/all-accounts`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (respAll.ok) {
+      const dataAll = await respAll.json();
+      const accounts = dataAll.accounts || [];
+      const match = accounts.find((a) => String(a.id) === String(accountId) || String(a.accNum) === String(accNum)) || accounts[0];
+      if (match) {
+        const bal = match.accountBalance ?? match.balance;
+        if (bal !== undefined && !isNaN(Number(bal))) {
+          return Number(bal);
+        }
+      }
+    }
+  } catch (_) {}
+
+  throw new Error('Unable to retrieve TradeLocker account balance for position sizing');
+}
+
 async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const baseUrl = getTradeLockerBaseUrl(config);
   const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/instruments`, {
@@ -241,7 +289,20 @@ async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
     routeId = tradeRoute ? tradeRoute.id : matched.routes[0].id;
   }
 
-  return { tradableInstrumentId, routeId, instrumentName: matched.name };
+  let contractSize = Number(matched.lotSize ?? matched.contractSize ?? matched.size ?? matched.unitsPerLot ?? 0);
+  if (!contractSize || isNaN(contractSize) || contractSize <= 0) {
+    if (/^[A-Z]{6}$/.test(cleanSymbol)) {
+      contractSize = 100000;
+    } else {
+      contractSize = 1;
+    }
+  }
+
+  const minQty = Number(matched.minLot ?? matched.minQty ?? 0.01);
+  const askPrice = Number(matched.ask ?? matched.askPrice ?? matched.price ?? 0);
+  const bidPrice = Number(matched.bid ?? matched.bidPrice ?? matched.price ?? 0);
+
+  return { tradableInstrumentId, routeId, instrumentName: matched.name, contractSize, minQty, askPrice, bidPrice };
 }
 
 async function createTradeLockerTrade(payload) {
@@ -262,14 +323,60 @@ async function createTradeLockerTrade(payload) {
 
   const validity = (type === 'market') ? 'IOC' : 'GTC';
 
-  const entry = payload.entry ?? payload.Entry ?? payload.price ?? payload.Price ?? payload.entryPrice ?? payload.entry_price;
-  const tp = payload.tp ?? payload.TP ?? payload.takeProfit ?? payload.TakeProfit ?? payload.take_profit;
-  const sl = payload.sl ?? payload.SL ?? payload.stopLoss ?? payload.StopLoss ?? payload.stop_loss;
-  const qty = Number(payload.qty ?? payload.Qty ?? payload.quantity ?? payload.Quantity ?? payload.volume ?? payload.Volume ?? payload.lots ?? config.tradelockerDefaultQty ?? 0.01);
+  let entry = payload.entry ?? payload.Entry ?? payload.price ?? payload.Price ?? payload.entryPrice ?? payload.entry_price;
+  let tp = payload.tp ?? payload.TP ?? payload.takeProfit ?? payload.TakeProfit ?? payload.take_profit;
+  let sl = payload.sl ?? payload.SL ?? payload.stopLoss ?? payload.StopLoss ?? payload.stop_loss;
 
   const placeOrderCall = async (authToken) => {
     const { accountId, accNum } = await getTradeLockerAccountDetails(authToken);
-    const { tradableInstrumentId, routeId, instrumentName } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
+    const { tradableInstrumentId, routeId, instrumentName, contractSize, minQty, askPrice, bidPrice } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
+
+    if ((entry === undefined || entry === null || entry === '') && type === 'market') {
+      entry = (side === 'buy') ? (askPrice || bidPrice) : (bidPrice || askPrice);
+    }
+
+    const entryNum = Number(entry);
+    let tpNum = Number(tp);
+    let slNum = Number(sl);
+
+    // Calculate 1:1 Risk-to-Reward Stop Loss from Entry & Take Profit (if TP and Entry are present and SL is missing)
+    if (!isNaN(entryNum) && entryNum > 0 && !isNaN(tpNum) && tpNum > 0 && (sl === undefined || sl === null || sl === '')) {
+      const tpDistance = Math.abs(entryNum - tpNum);
+      const calculatedSl = (side === 'buy') ? (entryNum - tpDistance) : (entryNum + tpDistance);
+      sl = Number(calculatedSl.toFixed(5));
+      slNum = Number(sl);
+    } else if (!isNaN(entryNum) && entryNum > 0 && !isNaN(slNum) && slNum > 0 && (tp === undefined || tp === null || tp === '')) {
+      // Fallback: If SL and Entry are present and TP is missing, calculate 1:1 TP
+      const slDistance = Math.abs(entryNum - slNum);
+      const calculatedTp = (side === 'buy') ? (entryNum + slDistance) : (entryNum - slDistance);
+      tp = Number(calculatedTp.toFixed(5));
+      tpNum = Number(tp);
+    }
+
+    // Position Sizing: Calculate quantity risking config.riskPercentage of current account balance
+    let qty = payload.qty ?? payload.Qty ?? payload.quantity ?? payload.Quantity ?? payload.volume ?? payload.Volume ?? payload.lots;
+
+    if (qty === undefined || qty === null || qty === '') {
+      const riskPercent = Number(payload.riskPercent ?? payload.risk ?? config.riskPercentage ?? 1);
+      if (!isNaN(entryNum) && entryNum > 0 && !isNaN(slNum) && slNum > 0) {
+        const slDistance = Math.abs(entryNum - slNum);
+        if (slDistance > 0) {
+          const balance = await getTradeLockerAccountBalance(authToken, accountId, accNum);
+          const riskAmount = balance * (riskPercent / 100);
+          const lossPerLot = slDistance * contractSize;
+          let calculatedQty = riskAmount / lossPerLot;
+
+          calculatedQty = Math.max(minQty || 0.01, Math.round(calculatedQty * 100) / 100);
+          qty = calculatedQty;
+          log(`Position Sizing: Account Balance = $${balance}, Risk (${riskPercent}%) = $${riskAmount.toFixed(2)}, SL Distance = ${slDistance}, Calculated Lots = ${qty}`);
+        }
+      }
+      if (qty === undefined || qty === null || qty === '') {
+        qty = Number(config.tradelockerDefaultQty ?? 0.01);
+      }
+    } else {
+      qty = Number(qty);
+    }
 
     const orderBody = {
       tradableInstrumentId,
@@ -295,29 +402,43 @@ async function createTradeLockerTrade(payload) {
       orderBody.stopLossType = 'absolute';
     }
 
-    const baseUrl = getTradeLockerBaseUrl(config);
-    const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/orders`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${authToken}`,
-        'accNum': String(accNum),
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(orderBody),
-      signal: AbortSignal.timeout(10_000),
-    });
+    const isDryRun = Boolean(payload.dryRun ?? payload.dry_run ?? config.dryRun);
 
-    if (resp.status === 401) {
-      throw new Error('UNAUTHORIZED_TOKEN');
+    // ALWAYS log the exact trade order details whether executing live or in dry-run mode
+    log(`Exact Trade Order Details ${isDryRun ? '(DRY-RUN - WOULD CREATE)' : '(SENDING TO BROKER)'}: ${JSON.stringify({ accountId, accNum, ...orderBody })}`);
+
+    let result;
+    let orderId;
+
+    if (isDryRun) {
+      orderId = `DRY-RUN-${Date.now()}`;
+      result = { status: 'DRY_RUN', simulated: true, orderId, orderBody };
+      log(`[DRY-RUN] Trade order simulated (not sent to broker). Order ID: ${orderId}`);
+    } else {
+      const baseUrl = getTradeLockerBaseUrl(config);
+      const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/orders`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${authToken}`,
+          'accNum': String(accNum),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(orderBody),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (resp.status === 401) {
+        throw new Error('UNAUTHORIZED_TOKEN');
+      }
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`TradeLocker place order failed (${resp.status}): ${text}`);
+      }
+
+      result = await resp.json();
+      orderId = result.d?.orderId ?? result.orderId ?? 'Unknown';
     }
-
-    if (!resp.ok) {
-      const text = await resp.text();
-      throw new Error(`TradeLocker place order failed (${resp.status}): ${text}`);
-    }
-
-    const result = await resp.json();
-    const orderId = result.d?.orderId ?? result.orderId ?? 'Unknown';
 
     return {
       orderId,
@@ -329,6 +450,7 @@ async function createTradeLockerTrade(payload) {
       tp: tp ?? 'N/A',
       sl: sl ?? 'N/A',
       result,
+      dryRun: isDryRun,
     };
   };
 
@@ -440,11 +562,12 @@ const server = http.createServer(async (req, res) => {
   } else if (isTradePath) {
     try {
       const tradeResult = await createTradeLockerTrade(payload);
+      const isDry = tradeResult.dryRun;
       
-      log(`TradeLocker order created successfully: ${JSON.stringify(tradeResult)}`);
+      log(`TradeLocker order ${isDry ? 'simulated (DRY RUN)' : 'created'} successfully: ${JSON.stringify(tradeResult)}`);
 
       const telegramText = [
-        '⚡ TradeLocker Trade Executed',
+        isDry ? '🧪 TradeLocker Trade (DRY RUN - SIMULATED)' : '⚡ TradeLocker Trade Executed',
         `Order ID: ${tradeResult.orderId}`,
         `Symbol: ${tradeResult.instrumentName}`,
         `Side: ${tradeResult.side.toUpperCase()}`,

@@ -101,6 +101,7 @@ e.g. `C:\tv-webhook\`.
   "ip": "<your-vps-ip>",
   "webhookPath": "/webhook",
   "tradePath": "/trade",
+  "healthPath": "/health",
   "guid": "REPLACE-WITH-A-RANDOM-GUID",
   "telegramBotToken": "REPLACE-WITH-YOUR-BOT-TOKEN",
   "telegramChatId": "REPLACE-WITH-YOUR-CHAT-ID",
@@ -110,7 +111,9 @@ e.g. `C:\tv-webhook\`.
   "tradelockerServer": "REPLACE-WITH-TRADELOCKER-SERVER",
   "tradelockerAccountId": "",
   "tradelockerAccNum": "",
-  "tradelockerDefaultQty": 0.01
+  "tradelockerDefaultQty": 0.01,
+  "riskPercentage": 1,
+  "dryRun": false
 }
 ```
 
@@ -132,12 +135,15 @@ e.g. `C:\tv-webhook\`.
   on the loopback address.
 - **webhookPath** — the URL path for simple Telegram notification forwarding (default `/webhook`).
 - **tradePath** — the URL path for TradeLocker automated order placement (default `/trade`).
+- **healthPath** — the URL path for health check endpoint (default `/health`).
 - **tradelockerEnvironment** — `https://demo.tradelocker.com` or `https://live.tradelocker.com`.
 - **tradelockerEmail** — Your TradeLocker login email address.
 - **tradelockerPassword** — Your TradeLocker login password.
 - **tradelockerServer** — Broker server name (as selected during TradeLocker login).
 - **tradelockerAccountId** / **tradelockerAccNum** — (Optional) Specific account ID / account number. If left blank, the server will auto-detect your active TradeLocker account.
-- **tradelockerDefaultQty** — Default trade lot size (e.g. `0.01`) if not supplied in the webhook payload.
+- **tradelockerDefaultQty** — Fallback trade lot size (e.g. `0.01`) if position sizing cannot be calculated.
+- **riskPercentage** — Percentage of current account balance to risk per trade (default `1` for 1%).
+- **dryRun** — Set to `true` for dry-run simulation mode (runs all authentication, calculations, and logging, but skips sending the actual trade order to the broker).
 
 You can edit `config.json` later (e.g. to rotate the GUID or update credentials) without
 restarting the process — the server watches the file and reloads it
@@ -193,7 +199,7 @@ Set the **Webhook URL** to:
 http://<your-vps-public-ip-or-domain>:80/trade
 ```
 
-Set the **Message** to JSON containing your GUID, symbol, side/action, entry, tp, sl, and qty:
+Set the **Message** to JSON containing your GUID, symbol, side/action, entry, and take profit (`tp`):
 
 ```json
 {
@@ -202,13 +208,14 @@ Set the **Message** to JSON containing your GUID, symbol, side/action, entry, tp
   "action": "BUY",
   "entry": "{{close}}",
   "tp": "1.1050",
-  "sl": "1.0950",
-  "qty": 0.01,
   "type": "market"
 }
 ```
 
-The server connects to TradeLocker via API, matches the symbol to the account's tradable instruments, places the trade with the entry, TP, and SL values, and forwards an execution summary (or error alert) to your Telegram chat.
+#### Automatic 1:1 Risk-to-Reward & Risk-Based Position Sizing:
+- **1:1 Stop Loss Calculation**: When `entry` and `tp` (Take Profit) are provided in the alert payload and `sl` is omitted, the server automatically calculates the **1:1 Stop Loss** (`entry - TP_distance` for BUY, or `entry + TP_distance` for SELL). You can still pass an explicit `"sl"` in the JSON payload to override this.
+- **Dynamic 1% Position Sizing**: If `"qty"` is omitted from the alert payload, the server fetches your current TradeLocker account balance and calculates the exact lot size so that the trade risks your configured percentage (`riskPercentage` in `config.json`, default **1%**). You can still pass an explicit `"qty"` to override automated position sizing.
+- The server connects to TradeLocker via API, matches the symbol to the account's tradable instruments, places the trade with the entry, TP, calculated 1:1 SL, and risk-sized lot quantity, and forwards an execution summary to your Telegram chat.
 
 ## 7. Running on port 80
 

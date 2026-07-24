@@ -1,7 +1,7 @@
 {
   "port": 80,
   "ip": "0.0.0.0",
-  "webhookPath": "/webhook",
+  "webhookPath": "/telegram",
   "tradePath": "/trade",
   "healthPath": "/health",
   "guid": "REPLACE-WITH-A-RANDOM-GUID",
@@ -13,6 +13,7 @@
   "tradelockerServer": "REPLACE-WITH-TRADELOCKER-SERVER",
   "tradelockerAccountId": "",
   "tradelockerAccNum": "",
-  "tradelockerDefaultQty": 0.01
+  "tradelockerDefaultQty": 0.01,
+  "riskPercentage": 1,
+  "dryRun": false
 }
-
