@@ -4,9 +4,11 @@
  * -------------------------------------------------------------------
  * Listens for POST requests from TradingView alerts:
  * 1) /webhook: validates GUID and forwards payload to Telegram chat.
- * 2) /trade: validates GUID, parses symbol, entry, TP, SL, side, and qty,
- *    connects to TradeLocker API using details from config.json, places the order,
- *    and sends an execution report to Telegram.
+ * 2) /trade: validates GUID, parses symbol, type (buy/sell), tp, and sl.
+ *    Entry is resolved from the live market price (market order), and qty
+ *    is calculated to risk config.riskPercentage of account balance.
+ *    Connects to TradeLocker API using details from config.json, places
+ *    the order, and sends an execution report to Telegram.
  * 3) /health: simple GET endpoint for health checks (returns 200 OK).
  *
  * Configuration is read from config.json in the same directory.
@@ -46,11 +48,12 @@ function loadConfig() {
     cfg.riskPercentage = Number(cfg.riskPercentage ?? cfg.tradelockerRiskPercent ?? 1);
   }
   cfg.dryRun = Boolean(cfg.dryRun ?? cfg.tradelockerDryRun ?? false);
+  cfg.maxOpenTrades = Number(cfg.maxOpenTrades ?? 1);
   return cfg;
 }
 
 let config = loadConfig();
-log(`Config loaded. Webhook path: ${config.webhookPath}, Trade path: ${config.tradePath}, Health path: ${config.healthPath}, Risk: ${config.riskPercentage}%, Dry Run: ${config.dryRun}, port: ${config.port}`);
+log(`Config loaded. Webhook path: ${config.webhookPath}, Trade path: ${config.tradePath}, Health path: ${config.healthPath}, Risk: ${config.riskPercentage}%, Max Open Trades: ${config.maxOpenTrades}, Dry Run: ${config.dryRun}, port: ${config.port}`);
 
 // Reload config.json automatically if you edit it (e.g. rotate GUID or update credentials)
 fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
@@ -250,6 +253,26 @@ async function getTradeLockerAccountBalance(token, accountId, accNum) {
   throw new Error('Unable to retrieve TradeLocker account balance for position sizing');
 }
 
+async function getTradeLockerOpenPositions(token, accountId, accNum) {
+  const baseUrl = getTradeLockerBaseUrl(config);
+  const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/positions`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'accNum': String(accNum),
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to fetch TradeLocker positions (${resp.status}): ${text}`);
+  }
+
+  const data = await resp.json();
+  return data.d?.positions || data.positions || [];
+}
+
 async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const baseUrl = getTradeLockerBaseUrl(config);
   const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/instruments`, {
@@ -313,70 +336,48 @@ async function createTradeLockerTrade(payload) {
     throw new Error('Payload is missing required parameter "symbol"');
   }
 
-  const rawSide = String(payload.side ?? payload.Side ?? payload.action ?? payload.Action ?? payload.direction ?? 'buy').toLowerCase();
-  const side = (rawSide.includes('sell') || rawSide.includes('short')) ? 'sell' : 'buy';
+  const rawSide = String(payload.type ?? payload.Type ?? payload.side ?? payload.Side ?? '').toLowerCase();
+  if (!rawSide.includes('buy') && !rawSide.includes('sell')) {
+    throw new Error('Payload must include "type": "buy" or "sell"');
+  }
+  const side = rawSide.includes('sell') ? 'sell' : 'buy';
+  const type = 'market'; // order execution type — always market for this endpoint
+  const validity = 'IOC';
 
-  const rawType = String(payload.type ?? payload.Type ?? payload.orderType ?? 'market').toLowerCase();
-  let type = 'market';
-  if (rawType.includes('limit')) type = 'limit';
-  else if (rawType.includes('stop')) type = 'stop';
-
-  const validity = (type === 'market') ? 'IOC' : 'GTC';
-
-  let entry = payload.entry ?? payload.Entry ?? payload.price ?? payload.Price ?? payload.entryPrice ?? payload.entry_price;
-  let tp = payload.tp ?? payload.TP ?? payload.takeProfit ?? payload.TakeProfit ?? payload.take_profit;
-  let sl = payload.sl ?? payload.SL ?? payload.stopLoss ?? payload.StopLoss ?? payload.stop_loss;
+  const tp = payload.tp ?? payload.TP ?? payload.takeProfit ?? payload.TakeProfit;
+  const sl = payload.sl ?? payload.SL ?? payload.stopLoss ?? payload.StopLoss;
+  if (tp === undefined || tp === null || tp === '' || isNaN(Number(tp))) {
+    throw new Error('Payload must include a numeric "tp" price');
+  }
+  if (sl === undefined || sl === null || sl === '' || isNaN(Number(sl))) {
+    throw new Error('Payload must include a numeric "sl" price');
+  }
+  const tpNum = Number(tp);
+  const slNum = Number(sl);
 
   const placeOrderCall = async (authToken) => {
     const { accountId, accNum } = await getTradeLockerAccountDetails(authToken);
+
+    // Max concurrent open trades check — reject new trades once the limit is reached.
+    const openPositions = await getTradeLockerOpenPositions(authToken, accountId, accNum);
+    if (openPositions.length >= config.maxOpenTrades) {
+      throw new Error(`Max open trades reached (${openPositions.length}/${config.maxOpenTrades}) — new trade rejected`);
+    }
+
     const { tradableInstrumentId, routeId, instrumentName, contractSize, minQty, askPrice, bidPrice } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
 
-    if ((entry === undefined || entry === null || entry === '') && type === 'market') {
-      entry = (side === 'buy') ? (askPrice || bidPrice) : (bidPrice || askPrice);
-    }
+    // Market order — entry is the current live price, not supplied by the payload.
+    const entryNum = side === 'buy' ? (askPrice || bidPrice) : (bidPrice || askPrice);
 
-    const entryNum = Number(entry);
-    let tpNum = Number(tp);
-    let slNum = Number(sl);
-
-    // Calculate 1:1 Risk-to-Reward Stop Loss from Entry & Take Profit (if TP and Entry are present and SL is missing)
-    if (!isNaN(entryNum) && entryNum > 0 && !isNaN(tpNum) && tpNum > 0 && (sl === undefined || sl === null || sl === '')) {
-      const tpDistance = Math.abs(entryNum - tpNum);
-      const calculatedSl = (side === 'buy') ? (entryNum - tpDistance) : (entryNum + tpDistance);
-      sl = Number(calculatedSl.toFixed(5));
-      slNum = Number(sl);
-    } else if (!isNaN(entryNum) && entryNum > 0 && !isNaN(slNum) && slNum > 0 && (tp === undefined || tp === null || tp === '')) {
-      // Fallback: If SL and Entry are present and TP is missing, calculate 1:1 TP
-      const slDistance = Math.abs(entryNum - slNum);
-      const calculatedTp = (side === 'buy') ? (entryNum + slDistance) : (entryNum - slDistance);
-      tp = Number(calculatedTp.toFixed(5));
-      tpNum = Number(tp);
-    }
-
-    // Position Sizing: Calculate quantity risking config.riskPercentage of current account balance
-    let qty = payload.qty ?? payload.Qty ?? payload.quantity ?? payload.Quantity ?? payload.volume ?? payload.Volume ?? payload.lots;
-
-    if (qty === undefined || qty === null || qty === '') {
-      const riskPercent = Number(payload.riskPercent ?? payload.risk ?? config.riskPercentage ?? 1);
-      if (!isNaN(entryNum) && entryNum > 0 && !isNaN(slNum) && slNum > 0) {
-        const slDistance = Math.abs(entryNum - slNum);
-        if (slDistance > 0) {
-          const balance = await getTradeLockerAccountBalance(authToken, accountId, accNum);
-          const riskAmount = balance * (riskPercent / 100);
-          const lossPerLot = slDistance * contractSize;
-          let calculatedQty = riskAmount / lossPerLot;
-
-          calculatedQty = Math.max(minQty || 0.01, Math.round(calculatedQty * 100) / 100);
-          qty = calculatedQty;
-          log(`Position Sizing: Account Balance = $${balance}, Risk (${riskPercent}%) = $${riskAmount.toFixed(2)}, SL Distance = ${slDistance}, Calculated Lots = ${qty}`);
-        }
-      }
-      if (qty === undefined || qty === null || qty === '') {
-        qty = Number(config.tradelockerDefaultQty ?? 0.01);
-      }
-    } else {
-      qty = Number(qty);
-    }
+    // Position sizing: quantity risking config.riskPercentage of current account balance
+    const riskPercent = Number(config.riskPercentage ?? 1);
+    const slDistance = Math.abs(entryNum - slNum);
+    const balance = await getTradeLockerAccountBalance(authToken, accountId, accNum);
+    const riskAmount = balance * (riskPercent / 100);
+    const lossPerLot = slDistance * contractSize;
+    let qty = lossPerLot > 0 ? riskAmount / lossPerLot : Number(config.tradelockerDefaultQty ?? 0.01);
+    qty = Math.max(minQty || 0.01, Math.round(qty * 100) / 100);
+    log(`Position Sizing: Entry = ${entryNum}, Account Balance = $${balance}, Risk (${riskPercent}%) = $${riskAmount.toFixed(2)}, SL Distance = ${slDistance}, Calculated Lots = ${qty}`);
 
     const orderBody = {
       tradableInstrumentId,
@@ -385,12 +386,8 @@ async function createTradeLockerTrade(payload) {
       type,
       validity,
       qty,
-      price: (type === 'market') ? 0 : Number(entry || 0),
+      price: 0,
     };
-
-    if (type === 'stop') {
-      orderBody.stopPrice = Number(entry || 0);
-    }
 
     if (tp !== undefined && tp !== null && tp !== '') {
       orderBody.takeProfit = Number(tp);
@@ -446,7 +443,7 @@ async function createTradeLockerTrade(payload) {
       side,
       type,
       qty,
-      entry: entry ?? 'Market',
+      entry: entryNum,
       tp: tp ?? 'N/A',
       sl: sl ?? 'N/A',
       result,
