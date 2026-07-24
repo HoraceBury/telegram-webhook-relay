@@ -39,11 +39,12 @@ function loadConfig() {
   }
   if (!cfg.webhookPath) cfg.webhookPath = '/webhook';
   if (!cfg.tradePath) cfg.tradePath = '/trade';
+  if (!cfg.healthPath) cfg.healthPath = '/health';
   return cfg;
 }
 
 let config = loadConfig();
-log(`Config loaded. Webhook path: ${config.webhookPath}, Trade path: ${config.tradePath}, port: ${config.port}`);
+log(`Config loaded. Webhook path: ${config.webhookPath}, Trade path: ${config.tradePath}, Health path: ${config.healthPath}, port: ${config.port}`);
 
 // Reload config.json automatically if you edit it (e.g. rotate GUID or update credentials)
 fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
@@ -54,6 +55,10 @@ fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
     log(`Failed to reload config.json: ${err.message} (keeping previous config)`);
   }
 });
+
+// -------------------------------------------------------------------
+// Telegram API Integration
+// -------------------------------------------------------------------
 
 async function sendTelegramMessage(text) {
   const url = `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`;
@@ -351,7 +356,12 @@ const server = http.createServer(async (req, res) => {
     if (!res.writableEnded) log('Connection closed before a response was sent.');
   });
 
-  if (req.method === 'GET' && req.url.split('?')[0] === '/health') {
+  const requestPath = req.url.split('?')[0];
+
+  // -------------------------------------------------------------------
+  // Health Check Endpoint
+  // -------------------------------------------------------------------
+  if (req.method === 'GET' && requestPath === config.healthPath) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
     return;
@@ -363,7 +373,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const requestPath = req.url.split('?')[0];
   const isWebhookPath = requestPath === config.webhookPath;
   const isTradePath = requestPath === config.tradePath;
 
@@ -409,6 +418,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // -------------------------------------------------------------------
+  // Telegram Webhook Relay Endpoint
+  // -------------------------------------------------------------------
   if (isWebhookPath) {
     const message = formatMessage(payload);
 
@@ -422,6 +434,9 @@ const server = http.createServer(async (req, res) => {
       res.end('Failed to notify Telegram');
       log(`Telegram send failed: ${err.message}`);
     }
+  // -------------------------------------------------------------------
+  // TradeLocker Order Execution Endpoint
+  // -------------------------------------------------------------------
   } else if (isTradePath) {
     try {
       const tradeResult = await createTradeLockerTrade(payload);
@@ -462,7 +477,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(config.port, config.ip, () => {
-  log(`Webhook server listening on http://${config.ip}:${config.port} (Webhook: ${config.webhookPath}, Trade: ${config.tradePath})`);
+  log(`Webhook server listening on http://${config.ip}:${config.port} (Webhook: ${config.webhookPath}, Trade: ${config.tradePath}, Health: ${config.healthPath})`);
 });
 
 process.on('uncaughtException', (err) => {
