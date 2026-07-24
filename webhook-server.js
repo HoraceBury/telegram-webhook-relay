@@ -580,6 +580,7 @@ const server = http.createServer(async (req, res) => {
 
       try {
         await sendTelegramMessage(telegramText);
+        log(`Trade execution alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
       } catch (tgErr) {
         log(`Failed to send trade execution alert to Telegram: ${tgErr.message}`);
       }
