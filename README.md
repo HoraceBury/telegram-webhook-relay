@@ -1,16 +1,18 @@
-# TradingView → Telegram Webhook Relay
+# TradingView → Telegram Webhook Relay & TradeLocker Execution
 
-A tiny Node.js server for a Windows VPS: TradingView calls it on alert,
-it checks a GUID, and forwards everything else in the alert to your
-Telegram chat.
+A tiny Node.js server for a Windows VPS with three jobs:
 
-Why Node.js over C# here: this is a single lightweight HTTP endpoint doing
-I/O (accept request → one outbound HTTPS call → respond). Node's event
-loop handles that with a very small idle memory/CPU footprint and no
-JIT warm-up or GC pauses of any real size at this scale. A C#/.NET
+- **`/webhook`** — TradingView alert → forwarded straight to your Telegram chat.
+- **`/trade`** — TradingView alert → validated, sized, and placed as a live (or dry-run) market order on TradeLocker, with a Telegram execution report.
+- **`/close`** — closes whatever position(s) are currently open on the account.
+
+Why Node.js over C# here: this is a handful of lightweight HTTP endpoints
+doing I/O (accept request → a few outbound HTTPS calls → respond). Node's
+event loop handles that with a very small idle memory/CPU footprint and
+no JIT warm-up or GC pauses of any real size at this scale. A C#/.NET
 service would do the job fine too, but carries a heavier baseline
 (runtime + GC + larger working set) for the same amount of work, so
-Node is the lighter choice for this specific workload.
+Node is the lighter choice for this workload.
 
 ## 1. Install required components
 
@@ -101,6 +103,7 @@ e.g. `C:\tv-webhook\`.
   "ip": "<your-vps-ip>",
   "webhookPath": "/webhook",
   "tradePath": "/trade",
+  "closePath": "/close",
   "healthPath": "/health",
   "guid": "REPLACE-WITH-A-RANDOM-GUID",
   "telegramBotToken": "REPLACE-WITH-YOUR-BOT-TOKEN",
@@ -113,6 +116,7 @@ e.g. `C:\tv-webhook\`.
   "tradelockerAccNum": "",
   "tradelockerDefaultQty": 0.01,
   "riskPercentage": 1,
+  "maxOpenTrades": 1,
   "dryRun": false
 }
 ```
@@ -135,15 +139,17 @@ e.g. `C:\tv-webhook\`.
   on the loopback address.
 - **webhookPath** — the URL path for simple Telegram notification forwarding (default `/webhook`).
 - **tradePath** — the URL path for TradeLocker automated order placement (default `/trade`).
-- **healthPath** — the URL path for health check endpoint (default `/health`).
+- **closePath** — the URL path for closing open position(s) (default `/close`).
+- **healthPath** — the URL path for the health check endpoint (default `/health`).
 - **tradelockerEnvironment** — `https://demo.tradelocker.com` or `https://live.tradelocker.com`.
 - **tradelockerEmail** — Your TradeLocker login email address.
 - **tradelockerPassword** — Your TradeLocker login password.
 - **tradelockerServer** — Broker server name (as selected during TradeLocker login).
 - **tradelockerAccountId** / **tradelockerAccNum** — (Optional) Specific account ID / account number. If left blank, the server will auto-detect your active TradeLocker account.
-- **tradelockerDefaultQty** — Fallback trade lot size (e.g. `0.01`) if position sizing cannot be calculated.
+- **tradelockerDefaultQty** — Fallback trade lot size (e.g. `0.01`) used only if position sizing can't be calculated (e.g. stop-loss distance is zero).
 - **riskPercentage** — Percentage of current account balance to risk per trade (default `1` for 1%).
-- **dryRun** — Set to `true` for dry-run simulation mode (runs all authentication, calculations, and logging, but skips sending the actual trade order to the broker).
+- **maxOpenTrades** — Maximum number of simultaneously open positions allowed. A `/trade` request is rejected once this many positions are already open (default `1`).
+- **dryRun** — Set to `true` to block real order placement account-wide (see the dryRun rules below — this cannot be overridden into a live trade by the payload).
 
 You can edit `config.json` later (e.g. to rotate the GUID or update credentials) without
 restarting the process — the server watches the file and reloads it
@@ -191,6 +197,8 @@ fields you want in the Telegram message, e.g.:
 }
 ```
 
+Every field except `guid` is forwarded to Telegram as `key: value` lines.
+
 ### B. TradeLocker Order Execution (`/trade`)
 
 Set the **Webhook URL** to:
@@ -199,23 +207,79 @@ Set the **Webhook URL** to:
 http://<your-vps-public-ip-or-domain>:80/trade
 ```
 
-Set the **Message** to JSON containing your GUID, symbol, side/action, entry, and take profit (`tp`):
+Set the **Message** to JSON containing your GUID, symbol, trade direction
+(`type`), take profit (`tp`), and stop loss (`sl`):
 
 ```json
 {
   "guid": "paste-the-same-guid-from-config.json",
   "symbol": "{{ticker}}",
-  "action": "BUY",
-  "entry": "{{close}}",
-  "tp": "1.1050",
-  "type": "market"
+  "type": "BUY",
+  "tp": "1.10500",
+  "sl": "1.10200"
 }
 ```
 
-#### Automatic 1:1 Risk-to-Reward & Risk-Based Position Sizing:
-- **1:1 Stop Loss Calculation**: When `entry` and `tp` (Take Profit) are provided in the alert payload and `sl` is omitted, the server automatically calculates the **1:1 Stop Loss** (`entry - TP_distance` for BUY, or `entry + TP_distance` for SELL). You can still pass an explicit `"sl"` in the JSON payload to override this.
-- **Dynamic 1% Position Sizing**: If `"qty"` is omitted from the alert payload, the server fetches your current TradeLocker account balance and calculates the exact lot size so that the trade risks your configured percentage (`riskPercentage` in `config.json`, default **1%**). You can still pass an explicit `"qty"` to override automated position sizing.
-- The server connects to TradeLocker via API, matches the symbol to the account's tradable instruments, places the trade with the entry, TP, calculated 1:1 SL, and risk-sized lot quantity, and forwards an execution summary to your Telegram chat.
+**Required fields:** `guid`, `symbol`, `type` (`"buy"` or `"sell"`), `tp`, `sl`.
+
+- **Market order only, no `entry` field** — every `/trade` order executes at
+  the live market price fetched from TradeLocker at the moment the request
+  is processed. There's no pending/limit order support here, so don't send
+  an `entry` value; it's ignored if you do.
+- **`sl` is required, not calculated** — you must supply the stop loss
+  directly. It's no longer derived automatically from `entry`/`tp`.
+- **Quantity is always calculated, not accepted from the payload** — the
+  server fetches your live TradeLocker account balance and sizes the
+  trade so it risks `riskPercentage` (from `config.json`) of that balance,
+  based on the distance between the live entry price and your `sl`. You
+  cannot override this by sending a `qty` field.
+- **Max open trades check** — if the account already has `maxOpenTrades`
+  (or more) open positions, the request is rejected before any order is
+  placed, and you get a Telegram alert explaining why.
+- **dryRun** — you can optionally include `"dryRun": true` or `"dryRun": false`
+  in the payload. See the rules below — a payload can only ever prevent a
+  live trade, never force one through.
+
+#### dryRun rules
+
+A real, live trade is placed **only if both** `config.json`'s `dryRun`
+**and** the payload's `dryRun` evaluate to `false`. If either one is
+`true`, the request is treated as a dry run — everything runs (auth,
+instrument lookup, position sizing, logging, Telegram alert) except the
+actual order isn't sent to the broker.
+
+| `config.json` `dryRun` | payload `dryRun` | Result |
+|---|---|---|
+| `true` | any value, or omitted | Dry run — no live trade |
+| `false` | omitted | **Live trade** |
+| `false` | `false` | **Live trade** |
+| `false` | `true` | Dry run — no live trade |
+
+In short: `true` anywhere wins. The payload can only ever make a trade
+*safer* (force a dry run), never turn a config-level dry run into a real
+one.
+
+### C. Close Open Position(s) (`/close`)
+
+Set the **Webhook URL** to:
+
+```
+http://<your-vps-public-ip-or-domain>:80/close
+```
+
+Set the **Message** to JSON containing just your GUID:
+
+```json
+{
+  "guid": "paste-the-same-guid-from-config.json"
+}
+```
+
+No symbol or direction needed — this closes every position currently open
+on the account (normally just the one, given the default `maxOpenTrades: 1`)
+and sends a Telegram confirmation listing what was closed. If nothing is
+open, it responds successfully with a "no open position" note instead of
+an error.
 
 ## 7. Running on port 80
 
@@ -268,3 +332,7 @@ system startup, with "Run whether user is logged on or not" checked.
   messages as your bot (though not read your other chats).
 - `webhook.log` in the same folder records every accepted/rejected
   request, useful for confirming TradingView is calling correctly.
+- The calculated quantity is floored at the instrument's minimum lot
+  size (typically 0.01). On very small accounts with a wide stop loss,
+  this floor can mean the actual risk taken exceeds `riskPercentage` —
+  the position simply can't be sized any smaller.
