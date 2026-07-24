@@ -3,6 +3,7 @@
   "ip": "0.0.0.0",
   "webhookPath": "/telegram",
   "tradePath": "/trade",
+  "closePath": "/close",
   "healthPath": "/health",
   "guid": "REPLACE-WITH-A-RANDOM-GUID",
   "telegramBotToken": "REPLACE-WITH-YOUR-BOT-TOKEN",
@@ -15,5 +16,6 @@
   "tradelockerAccNum": "",
   "tradelockerDefaultQty": 0.01,
   "riskPercentage": 1,
+  "maxOpenTrades": 1,
   "dryRun": false
 }

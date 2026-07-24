@@ -41,6 +41,7 @@ function loadConfig() {
   }
   if (!cfg.webhookPath) cfg.webhookPath = '/webhook';
   if (!cfg.tradePath) cfg.tradePath = '/trade';
+  if (!cfg.closePath) cfg.closePath = '/close';
   if (!cfg.healthPath) cfg.healthPath = '/health';
   if (cfg.riskPercentage === undefined && cfg.tradelockerRiskPercent === undefined) {
     cfg.riskPercentage = 1;
@@ -273,6 +274,39 @@ async function getTradeLockerOpenPositions(token, accountId, accNum) {
   return data.d?.positions || data.positions || [];
 }
 
+async function closeTradeLockerPosition(token, accountId, accNum, positionId) {
+  const baseUrl = getTradeLockerBaseUrl(config);
+  const resp = await fetch(`${baseUrl}/trade/positions/${positionId}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'accNum': String(accNum),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ qty: 0 }), // qty: 0 = fully close the position
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resp.ok && resp.status !== 204) {
+    const text = await resp.text();
+    throw new Error(`Failed to close position ${positionId} (${resp.status}): ${text}`);
+  }
+}
+
+async function closeAllTradeLockerPositions() {
+  let token = await getTradeLockerToken();
+  const { accountId, accNum } = await getTradeLockerAccountDetails(token);
+  const positions = await getTradeLockerOpenPositions(token, accountId, accNum);
+
+  const closed = [];
+  for (const p of positions) {
+    const positionId = p.positionId ?? p.id;
+    await closeTradeLockerPosition(token, accountId, accNum, positionId);
+    closed.push({ positionId, instrument: p.instrument ?? p.name, side: p.side, qty: p.lots ?? p.qty });
+  }
+  return closed;
+}
+
 async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const baseUrl = getTradeLockerBaseUrl(config);
   const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/instruments`, {
@@ -494,8 +528,9 @@ const server = http.createServer(async (req, res) => {
 
   const isWebhookPath = requestPath === config.webhookPath;
   const isTradePath = requestPath === config.tradePath;
+  const isClosePath = requestPath === config.closePath;
 
-  if (!isWebhookPath && !isTradePath) {
+  if (!isWebhookPath && !isTradePath && !isClosePath) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
     return;
@@ -593,6 +628,37 @@ const server = http.createServer(async (req, res) => {
 
       res.writeHead(502, { 'Content-Type': 'text/plain' });
       res.end(`Trade creation failed: ${err.message}`);
+    }
+  // -------------------------------------------------------------------
+  // TradeLocker Close Position Endpoint
+  // -------------------------------------------------------------------
+  } else if (isClosePath) {
+    try {
+      const closed = await closeAllTradeLockerPositions();
+      log(`Closed ${closed.length} TradeLocker position(s): ${JSON.stringify(closed)}`);
+
+      const telegramText = closed.length > 0
+        ? ['🔒 TradeLocker Position(s) Closed', ...closed.map((p) => `${p.instrument} ${p.side} qty ${p.qty} (positionId ${p.positionId})`)].join('\n')
+        : 'ℹ️ /close called — no open position to close';
+
+      try {
+        await sendTelegramMessage(telegramText);
+        log(`Close alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
+      } catch (tgErr) {
+        log(`Failed to send close alert to Telegram: ${tgErr.message}`);
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'OK', closed }));
+    } catch (err) {
+      log(`Position close failed: ${err.message}`);
+
+      try {
+        await sendTelegramMessage(`❌ Position Close FAILED\nError: ${err.message}`);
+      } catch (_) {}
+
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end(`Position close failed: ${err.message}`);
     }
   }
 });
