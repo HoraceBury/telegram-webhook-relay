@@ -433,9 +433,9 @@ async function createTradeLockerTrade(payload) {
       orderBody.stopLossType = 'absolute';
     }
 
-    // dryRun can only be relaxed from true (config) to false (payload) —
-    // if config.dryRun is false, no payload value can force live trading on.
-    const isDryRun = Boolean(config.dryRun) && Boolean(payload.dryRun ?? payload.dry_run ?? true);
+    // dryRun:true from EITHER config or payload blocks a live trade. A live
+    // trade only happens when both are false (payload omitted = false).
+    const isDryRun = Boolean(config.dryRun) || Boolean(payload.dryRun ?? payload.dry_run ?? false);
 
     // ALWAYS log the exact trade order details whether executing live or in dry-run mode
     log(`Exact Trade Order Details ${isDryRun ? '(DRY-RUN - WOULD CREATE)' : '(SENDING TO BROKER)'}: ${JSON.stringify({ accountId, accNum, ...orderBody })}`);
