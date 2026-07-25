@@ -321,7 +321,7 @@ async function getTradeLockerOpenPositions(token, accountId, accNum) {
   log(`Open positions raw response: ${JSON.stringify(data).slice(0, 1000)}`);
 
   const cfg = await getTradeLockerConfig(token, accNum);
-  const positionsConfig = cfg.positionsConfig || cfg.positions || [];
+  const positionsConfig = cfg.positionsConfig?.columns || cfg.positionsConfig || cfg.positions || [];
   log(`Positions column config: ${JSON.stringify(positionsConfig)}`);
 
   const positions = mapRowsToObjects(rawPositions, positionsConfig);
