@@ -146,6 +146,30 @@ e.g. `C:\tv-webhook\`.
 - **tradelockerPassword** — Your TradeLocker login password.
 - **tradelockerServer** — Broker server name (as selected during TradeLocker login).
 - **tradelockerAccountId** / **tradelockerAccNum** — (Optional) Specific account ID / account number. If left blank, the server will auto-detect your active TradeLocker account.
+
+  **Important:** these two values must come from the **same** account —
+  they're a pair, not independent settings. TradeLocker's `accNum` is a
+  small internal number (e.g. `1`, `2`) and is **not** the account number
+  shown in your broker's dashboard (e.g. PlexyTrade) — don't use that
+  one. If you have more than one account (e.g. multiple demo accounts)
+  and need to pick a specific one:
+
+  1. Leave both fields blank and send a `/trade` request with
+     `"dryRun": true`.
+  2. Check `webhook.log` for a line like:
+     ```
+     TradeLocker accounts found: [{"id":"1111111","accNum":"1","name":"...","status":"ACTIVE","accountBalance":"994.54"},{"id":"2222222","accNum":"2","name":"...","status":"ACTIVE","accountBalance":"1000.00"}]
+     ```
+     This lists every account visible to your login.
+  3. Pick the account you want by its `accountBalance`/`name`, then copy
+     its `id` **and** `accNum` from that *same* object into
+     `tradelockerAccountId` and `tradelockerAccNum`. Mixing the `id` from
+     one account with the `accNum` from another returns
+     `"Account not found!"` when placing a trade.
+
+  Auto-detect (leaving both blank) picks the first account marked
+  `ACTIVE`, which may not be the one you intend if you have several
+  active accounts — setting both explicitly avoids that ambiguity.
 - **tradelockerDefaultQty** — Fallback trade lot size (e.g. `0.01`) used only if position sizing can't be calculated (e.g. stop-loss distance is zero).
 - **riskPercentage** — Percentage of current account balance to risk per trade (default `1` for 1%).
 - **maxOpenTrades** — Maximum number of simultaneously open positions allowed. A `/trade` request is rejected once this many positions are already open (default `1`).
