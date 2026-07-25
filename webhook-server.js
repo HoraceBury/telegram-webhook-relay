@@ -205,9 +205,13 @@ async function getTradeLockerAccountDetails(token) {
     throw new Error('No TradeLocker trading accounts associated with this login');
   }
 
+  log(`TradeLocker accounts found: ${JSON.stringify(accounts.map((a) => ({ id: a.id, accNum: a.accNum, name: a.name, status: a.status, currency: a.currency, accountBalance: a.accountBalance })))}`);
+
   const activeAcc = accounts.find((a) => a.status === 'ACTIVE') || accounts[0];
   accountId = accountId || String(activeAcc.id);
   accNum = accNum || String(activeAcc.accNum);
+
+  log(`Using TradeLocker account: accountId=${accountId}, accNum=${accNum} (name=${activeAcc.name}, status=${activeAcc.status})`);
 
   return { accountId, accNum };
 }
