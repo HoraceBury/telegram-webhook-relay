@@ -311,6 +311,36 @@ async function closeAllTradeLockerPositions() {
   return closed;
 }
 
+async function getTradeLockerQuote(token, accountId, accNum, tradableInstrumentId, routeId) {
+  const baseUrl = getTradeLockerBaseUrl(config);
+  const resp = await fetch(`${baseUrl}/trade/quotes?tradableInstrumentId=${tradableInstrumentId}&routeId=${routeId}`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'accNum': String(accNum),
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to fetch TradeLocker quote (${resp.status}): ${text}`);
+  }
+
+  const data = await resp.json();
+  log(`Quote response for instrument ${tradableInstrumentId}: ${JSON.stringify(data).slice(0, 500)}`);
+
+  const q = (Array.isArray(data.d?.quotes) && data.d.quotes[0]) || (Array.isArray(data.quotes) && data.quotes[0]) || data.d || data;
+  const ask = Number(q.ask ?? q.askPrice ?? 0);
+  const bid = Number(q.bid ?? q.bidPrice ?? 0);
+
+  if (!ask && !bid) {
+    throw new Error(`TradeLocker returned no usable ask/bid for instrument ${tradableInstrumentId} — check the "Quote response for instrument..." log line and verify the /trade/quotes response shape`);
+  }
+
+  return { ask, bid };
+}
+
 async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const baseUrl = getTradeLockerBaseUrl(config);
   const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/instruments`, {
@@ -362,11 +392,10 @@ async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
 
   let contractSize = Number(matched.lotSize ?? matched.contractSize ?? matched.size ?? matched.unitsPerLot ?? 0);
   if (!contractSize || isNaN(contractSize) || contractSize <= 0) {
-    if (/^[A-Z]{6}$/.test(cleanSymbol)) {
-      contractSize = 100000;
-    } else {
-      contractSize = 1;
-    }
+    const knownCryptoPrefixes = ['BTC', 'ETH', 'XRP', 'LTC', 'BCH', 'ADA', 'SOL', 'DOGE', 'DOT', 'BNB'];
+    const isCrypto = knownCryptoPrefixes.some((p) => cleanSymbol.startsWith(p));
+    contractSize = (!isCrypto && /^[A-Z]{6}$/.test(cleanSymbol)) ? 100000 : 1;
+    log(`WARNING: TradeLocker did not report a lot size for "${matched.name}" — guessing contractSize=${contractSize}. Verify this against the broker's real contract size before trusting position sizing.`);
   }
 
   const minQty = Number(matched.minLot ?? matched.minQty ?? 0.01);
@@ -412,10 +441,11 @@ async function createTradeLockerTrade(payload) {
       throw new Error(`Max open trades reached (${openPositions.length}/${config.maxOpenTrades}) — new trade rejected`);
     }
 
-    const { tradableInstrumentId, routeId, instrumentName, contractSize, minQty, askPrice, bidPrice } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
+    const { tradableInstrumentId, routeId, instrumentName, contractSize, minQty } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
 
-    // Market order — entry is the current live price, not supplied by the payload.
-    const entryNum = side === 'buy' ? (askPrice || bidPrice) : (bidPrice || askPrice);
+    // Market order — entry is the current live price, fetched from the quotes endpoint.
+    const { ask, bid } = await getTradeLockerQuote(authToken, accountId, accNum, tradableInstrumentId, routeId);
+    const entryNum = side === 'buy' ? (ask || bid) : (bid || ask);
 
     // Position sizing: quantity risking config.riskPercentage of current account balance
     const riskPercent = Number(config.riskPercentage ?? 1);
