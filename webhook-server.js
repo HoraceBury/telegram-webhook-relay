@@ -330,6 +330,10 @@ async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const data = await resp.json();
   const instruments = data.d?.instruments || data.instruments || [];
 
+  if (instruments.length === 0) {
+    log(`Instruments list came back empty for accountId=${accountId}, accNum=${accNum}. Raw response: ${JSON.stringify(data).slice(0, 2000)}`);
+  }
+
   const cleanSymbol = String(rawSymbol).toUpperCase().replace(/[\/\-_.]/g, '');
 
   let matched = instruments.find((i) => String(i.name).toUpperCase().replace(/[\/\-_.]/g, '') === cleanSymbol);
