@@ -258,6 +258,48 @@ async function getTradeLockerAccountBalance(token, accountId, accNum) {
   throw new Error('Unable to retrieve TradeLocker account balance for position sizing');
 }
 
+let tlConfigCache = null;
+
+async function getTradeLockerConfig(token, accNum) {
+  if (tlConfigCache) return tlConfigCache;
+  const baseUrl = getTradeLockerBaseUrl(config);
+  const resp = await fetch(`${baseUrl}/trade/config`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'accNum': String(accNum),
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to fetch TradeLocker config (${resp.status}): ${text}`);
+  }
+
+  const data = await resp.json();
+  tlConfigCache = data.d ?? data;
+  log(`TradeLocker config fetched. Top-level keys: ${JSON.stringify(Object.keys(tlConfigCache))}`);
+  return tlConfigCache;
+}
+
+// Positions (and several other endpoints) return rows as plain arrays, with
+// the column order defined separately in /trade/config. This turns each row
+// into a proper keyed object using that column list.
+function mapRowsToObjects(rows, columnsConfig) {
+  if (!Array.isArray(rows)) return [];
+  if (!Array.isArray(columnsConfig) || columnsConfig.length === 0) return rows;
+  return rows.map((row) => {
+    if (!Array.isArray(row)) return row; // already an object — nothing to map
+    const obj = {};
+    columnsConfig.forEach((col, i) => {
+      const name = typeof col === 'string' ? col : (col.id ?? col.name ?? col.field ?? `col${i}`);
+      obj[name] = row[i];
+    });
+    return obj;
+  });
+}
+
 async function getTradeLockerOpenPositions(token, accountId, accNum) {
   const baseUrl = getTradeLockerBaseUrl(config);
   const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/positions`, {
@@ -275,8 +317,15 @@ async function getTradeLockerOpenPositions(token, accountId, accNum) {
   }
 
   const data = await resp.json();
-  const positions = data.d?.positions || data.positions || [];
+  const rawPositions = data.d?.positions || data.positions || [];
   log(`Open positions raw response: ${JSON.stringify(data).slice(0, 1000)}`);
+
+  const cfg = await getTradeLockerConfig(token, accNum);
+  const positionsConfig = cfg.positionsConfig || cfg.positions || [];
+  log(`Positions column config: ${JSON.stringify(positionsConfig)}`);
+
+  const positions = mapRowsToObjects(rawPositions, positionsConfig);
+  log(`Mapped positions: ${JSON.stringify(positions)}`);
   return positions;
 }
 
@@ -306,12 +355,12 @@ async function closeAllTradeLockerPositions() {
 
   const closed = [];
   for (const p of positions) {
-    const positionId = p.positionId ?? p.id;
+    const positionId = p.positionId ?? p.id ?? p.PositionID;
     if (!positionId) {
-      throw new Error(`Could not determine positionId from position data — check the "Open positions raw response" log line and update the field mapping. Raw position: ${JSON.stringify(p)}`);
+      throw new Error(`Could not determine positionId from position data — check the "Mapped positions" log line and update the field mapping. Raw position: ${JSON.stringify(p)}`);
     }
     await closeTradeLockerPosition(token, accountId, accNum, positionId);
-    closed.push({ positionId, instrument: p.instrument ?? p.name, side: p.side, qty: p.lots ?? p.qty });
+    closed.push({ positionId, instrument: p.instrument ?? p.name ?? p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
   }
   return closed;
 }
