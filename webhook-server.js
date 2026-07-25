@@ -331,8 +331,8 @@ async function getTradeLockerQuote(token, accountId, accNum, tradableInstrumentI
   log(`Quote response for instrument ${tradableInstrumentId}: ${JSON.stringify(data).slice(0, 500)}`);
 
   const q = (Array.isArray(data.d?.quotes) && data.d.quotes[0]) || (Array.isArray(data.quotes) && data.quotes[0]) || data.d || data;
-  const ask = Number(q.ask ?? q.askPrice ?? 0);
-  const bid = Number(q.bid ?? q.bidPrice ?? 0);
+  const ask = Number(q.ap ?? q.ask ?? q.askPrice ?? 0);
+  const bid = Number(q.bp ?? q.bid ?? q.bidPrice ?? 0);
 
   if (!ask && !bid) {
     throw new Error(`TradeLocker returned no usable ask/bid for instrument ${tradableInstrumentId} — check the "Quote response for instrument..." log line and verify the /trade/quotes response shape`);
