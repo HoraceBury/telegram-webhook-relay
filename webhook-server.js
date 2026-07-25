@@ -340,6 +340,12 @@ async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   }
 
   if (!matched) {
+    const allNames = instruments.map((i) => i.name);
+    const looksClose = allNames.filter((n) => {
+      const c = String(n).toUpperCase().replace(/[\/\-_.]/g, '');
+      return c.includes(cleanSymbol.slice(0, 3)) || cleanSymbol.includes(c.slice(0, 3));
+    });
+    log(`Symbol match failed for "${rawSymbol}". Closest-looking instrument names: ${JSON.stringify(looksClose)}. Full instrument list (${allNames.length} total): ${JSON.stringify(allNames)}`);
     throw new Error(`Symbol "${rawSymbol}" could not be matched to any available TradeLocker instrument`);
   }
 
