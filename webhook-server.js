@@ -275,7 +275,9 @@ async function getTradeLockerOpenPositions(token, accountId, accNum) {
   }
 
   const data = await resp.json();
-  return data.d?.positions || data.positions || [];
+  const positions = data.d?.positions || data.positions || [];
+  log(`Open positions raw response: ${JSON.stringify(data).slice(0, 1000)}`);
+  return positions;
 }
 
 async function closeTradeLockerPosition(token, accountId, accNum, positionId) {
@@ -305,6 +307,9 @@ async function closeAllTradeLockerPositions() {
   const closed = [];
   for (const p of positions) {
     const positionId = p.positionId ?? p.id;
+    if (!positionId) {
+      throw new Error(`Could not determine positionId from position data — check the "Open positions raw response" log line and update the field mapping. Raw position: ${JSON.stringify(p)}`);
+    }
     await closeTradeLockerPosition(token, accountId, accNum, positionId);
     closed.push({ positionId, instrument: p.instrument ?? p.name, side: p.side, qty: p.lots ?? p.qty });
   }
