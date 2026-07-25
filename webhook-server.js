@@ -385,9 +385,12 @@ async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
 
   const tradableInstrumentId = matched.tradableInstrumentId;
   let routeId = 0;
+  let infoRouteId = 0;
   if (Array.isArray(matched.routes) && matched.routes.length > 0) {
     const tradeRoute = matched.routes.find((r) => r.type === 'TRADE');
+    const infoRoute = matched.routes.find((r) => r.type === 'INFO');
     routeId = tradeRoute ? tradeRoute.id : matched.routes[0].id;
+    infoRouteId = infoRoute ? infoRoute.id : routeId;
   }
 
   let contractSize = Number(matched.lotSize ?? matched.contractSize ?? matched.size ?? matched.unitsPerLot ?? 0);
@@ -402,7 +405,7 @@ async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const askPrice = Number(matched.ask ?? matched.askPrice ?? matched.price ?? 0);
   const bidPrice = Number(matched.bid ?? matched.bidPrice ?? matched.price ?? 0);
 
-  return { tradableInstrumentId, routeId, instrumentName: matched.name, contractSize, minQty, askPrice, bidPrice };
+  return { tradableInstrumentId, routeId, infoRouteId, instrumentName: matched.name, contractSize, minQty, askPrice, bidPrice };
 }
 
 async function createTradeLockerTrade(payload) {
@@ -441,10 +444,11 @@ async function createTradeLockerTrade(payload) {
       throw new Error(`Max open trades reached (${openPositions.length}/${config.maxOpenTrades}) — new trade rejected`);
     }
 
-    const { tradableInstrumentId, routeId, instrumentName, contractSize, minQty } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
+    const { tradableInstrumentId, routeId, infoRouteId, instrumentName, contractSize, minQty } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
 
     // Market order — entry is the current live price, fetched from the quotes endpoint.
-    const { ask, bid } = await getTradeLockerQuote(authToken, accountId, accNum, tradableInstrumentId, routeId);
+    // Quotes require the INFO routeId, not the TRADE routeId used for order placement.
+    const { ask, bid } = await getTradeLockerQuote(authToken, accountId, accNum, tradableInstrumentId, infoRouteId);
     const entryNum = side === 'buy' ? (ask || bid) : (bid || ask);
 
     // Position sizing: quantity risking config.riskPercentage of current account balance
