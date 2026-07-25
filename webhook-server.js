@@ -425,7 +425,7 @@ async function createTradeLockerTrade(payload) {
     const lossPerLot = slDistance * contractSize;
     let qty = lossPerLot > 0 ? riskAmount / lossPerLot : Number(config.tradelockerDefaultQty ?? 0.01);
     qty = Math.max(minQty || 0.01, Math.round(qty * 100) / 100);
-    log(`Position Sizing: Entry = ${entryNum}, Account Balance = $${balance}, Risk (${riskPercent}%) = $${riskAmount.toFixed(2)}, SL Distance = ${slDistance}, Calculated Lots = ${qty}`);
+    log(`Position Sizing: Entry = ${entryNum}, Contract Size = ${contractSize}, Account Balance = $${balance}, Risk (${riskPercent}%) = $${riskAmount.toFixed(2)}, SL Distance = ${slDistance}, Calculated Lots = ${qty}`);
 
     const orderBody = {
       tradableInstrumentId,
