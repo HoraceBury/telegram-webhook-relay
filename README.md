@@ -3,8 +3,12 @@
 A tiny Node.js server for a Windows VPS with three jobs:
 
 - **`/webhook`** — TradingView alert → forwarded straight to your Telegram chat.
-- **`/trade`** — TradingView alert → validated, sized, and placed as a live (or dry-run) market order on TradeLocker, with a Telegram execution report.
-- **`/close`** — closes whatever position(s) are currently open on the account.
+- **`/trade`** — TradingView alert → validated, sized, and placed as a live (or dry-run) market order on TradeLocker, with a Telegram execution report. The **same endpoint also handles closing** — see Section 6B.
+- **`/close`** — closes open position(s), optionally scoped to one instrument.
+
+Plus a **Telegram "Close" button**: every trade-opened message is followed
+by a message with a button that closes that instrument's position(s)
+directly from Telegram — see Section 6D.
 
 Why Node.js over C# here: this is a handful of lightweight HTTP endpoints
 doing I/O (accept request → a few outbound HTTPS calls → respond). Node's
@@ -138,8 +142,8 @@ e.g. `C:\tv-webhook\`.
   use this IP rather than `localhost`, since the app won't be listening
   on the loopback address.
 - **webhookPath** — the URL path for simple Telegram notification forwarding (default `/webhook`).
-- **tradePath** — the URL path for TradeLocker automated order placement (default `/trade`).
-- **closePath** — the URL path for closing open position(s) (default `/close`).
+- **tradePath** — the URL path for TradeLocker order placement **and** closing (default `/trade`). See Section 6B — whether it opens or closes depends on the payload, not the URL.
+- **closePath** — an alternate, close-only URL if you'd rather keep it separate from `/trade` (default `/close`).
 - **healthPath** — the URL path for the health check endpoint (default `/health`).
 - **tradelockerEnvironment** — `https://demo.tradelocker.com` or `https://live.tradelocker.com`.
 - **tradelockerEmail** — Your TradeLocker login email address.
@@ -172,7 +176,7 @@ e.g. `C:\tv-webhook\`.
   active accounts — setting both explicitly avoids that ambiguity.
 - **tradelockerDefaultQty** — Fallback trade lot size (e.g. `0.01`) used only if position sizing can't be calculated (e.g. stop-loss distance is zero).
 - **riskPercentage** — Percentage of current account balance to risk per trade (default `1` for 1%).
-- **maxOpenTrades** — Maximum number of simultaneously open positions allowed. A `/trade` request is rejected once this many positions are already open (default `1`).
+- **maxOpenTrades** — Maximum simultaneously open positions **per instrument**. A `/trade` open request for a given symbol is rejected once that symbol already has this many positions open — a GBPUSD position doesn't block a new EURUSD or BTCUSD trade.
 - **dryRun** — Set to `true` to block real order placement account-wide (see the dryRun rules below — this cannot be overridden into a live trade by the payload).
 
 You can edit `config.json` later (e.g. to rotate the GUID or update credentials) without
@@ -223,7 +227,7 @@ fields you want in the Telegram message, e.g.:
 
 Every field except `guid` is forwarded to Telegram as `key: value` lines.
 
-### B. TradeLocker Order Execution (`/trade`)
+### B. TradeLocker Order Execution & Close (`/trade`)
 
 Set the **Webhook URL** to:
 
@@ -231,7 +235,14 @@ Set the **Webhook URL** to:
 http://<your-vps-public-ip-or-domain>:80/trade
 ```
 
-Set the **Message** to JSON containing your GUID, symbol, trade direction
+**This single URL handles both opening and closing trades.** The server
+looks at whether the payload has a `type` field: present → open a trade;
+absent → close position(s) for that `symbol`. This means one TradingView
+alert (one fixed webhook URL, since TradingView only lets you set one per
+alert) can drive your whole open/close cycle — exactly what the
+accompanying Pine indicator's `alert()` calls are built to do.
+
+**To open a trade**, the message needs your GUID, symbol, trade direction
 (`type`), take profit (`tp`), and stop loss (`sl`):
 
 ```json
@@ -244,25 +255,45 @@ Set the **Message** to JSON containing your GUID, symbol, trade direction
 }
 ```
 
-**Required fields:** `guid`, `symbol`, `type` (`"buy"` or `"sell"`), `tp`, `sl`.
+**Required fields to open:** `guid`, `symbol`, `type` (`"buy"` or `"sell"`), `tp`, `sl`.
 
-- **Market order only, no `entry` field** — every `/trade` order executes at
-  the live market price fetched from TradeLocker at the moment the request
-  is processed. There's no pending/limit order support here, so don't send
+- **Market order only, no `entry` field** — every open executes at the
+  live market price fetched from TradeLocker at the moment the request is
+  processed. There's no pending/limit order support here, so don't send
   an `entry` value; it's ignored if you do.
 - **`sl` is required, not calculated** — you must supply the stop loss
-  directly. It's no longer derived automatically from `entry`/`tp`.
+  directly. It's not derived automatically from `entry`/`tp`.
 - **Quantity is always calculated, not accepted from the payload** — the
   server fetches your live TradeLocker account balance and sizes the
   trade so it risks `riskPercentage` (from `config.json`) of that balance,
   based on the distance between the live entry price and your `sl`. You
-  cannot override this by sending a `qty` field.
-- **Max open trades check** — if the account already has `maxOpenTrades`
-  (or more) open positions, the request is rejected before any order is
-  placed, and you get a Telegram alert explaining why.
+  cannot override this by sending a `qty` field. The result is floored to
+  the instrument's minimum lot size (see the sizing caveat in Section 9).
+- **Max open trades check is per instrument** — see `maxOpenTrades` above.
 - **dryRun** — you can optionally include `"dryRun": true` or `"dryRun": false`
   in the payload. See the rules below — a payload can only ever prevent a
   live trade, never force one through.
+
+**To close a trade**, omit `type` — just send `guid` and `symbol`:
+
+```json
+{
+  "guid": "paste-the-same-guid-from-config.json",
+  "symbol": "{{ticker}}"
+}
+```
+
+This closes only the position(s) open on that specific symbol, not the
+whole account.
+
+#### Contract size caveat
+
+If TradeLocker doesn't report a real lot size for an instrument, the
+server guesses (`100000` for standard 6-letter FX pairs, `1` for known
+crypto tickers and everything else) and logs a `WARNING: ... guessing
+contractSize=...` line whenever this happens. Check `webhook.log` for
+that warning on any new symbol before trusting its position sizing —
+a wrong guess here silently skews how much is actually risked.
 
 #### dryRun rules
 
@@ -281,29 +312,56 @@ actual order isn't sent to the broker.
 
 In short: `true` anywhere wins. The payload can only ever make a trade
 *safer* (force a dry run), never turn a config-level dry run into a real
-one.
+one. (This flag only affects opening; closing always executes for real,
+dry-run or not — closing a position that doesn't exist is harmless and
+just responds with "no open position.")
 
-### C. Close Open Position(s) (`/close`)
+### C. Close-Only Endpoint (`/close`)
 
-Set the **Webhook URL** to:
+An alternative to sending a typeless `/trade` request — functionally
+identical, kept as a separate URL if you'd rather not rely on payload
+shape for routing.
 
 ```
 http://<your-vps-public-ip-or-domain>:80/close
 ```
 
-Set the **Message** to JSON containing just your GUID:
-
 ```json
 {
-  "guid": "paste-the-same-guid-from-config.json"
+  "guid": "paste-the-same-guid-from-config.json",
+  "symbol": "{{ticker}}"
 }
 ```
 
-No symbol or direction needed — this closes every position currently open
-on the account (normally just the one, given the default `maxOpenTrades: 1`)
-and sends a Telegram confirmation listing what was closed. If nothing is
-open, it responds successfully with a "no open position" note instead of
-an error.
+`symbol` is optional here: if omitted, **every** open position on the
+account is closed, not just one instrument. Include it to scope the
+close to a single symbol, same as `/trade`'s close behavior.
+
+### D. Telegram "Close" Button
+
+Every successful trade-open (live or dry-run) triggers a second Telegram
+message, right after the execution report, with a single button:
+
+```
+🔴 Close <instrument>
+```
+
+Pressing it closes that instrument's open position(s) — same effect as
+sending a typeless `/trade`/`/close` request for that symbol — and posts
+a confirmation back to the chat.
+
+**How it works:** Telegram delivers button presses as "callback queries."
+Real-time push delivery would need an HTTPS webhook from Telegram's side,
+which this server doesn't have (see Section 9's note on TLS), so instead
+the server **long-polls** Telegram (asks for updates, Telegram holds the
+connection open until something happens or ~30s elapses) for up to 10
+polls — about **5 minutes** — after a trade opens, then stops. Only one
+polling session runs at a time; if a trade opens while a session from an
+earlier trade is still active, it doesn't start a second one — the
+existing session still catches the new button press too. If you press
+"Close" more than ~5 minutes after the most recent trade (with no other
+trade having opened since to restart the window), the button won't work;
+use `/close` or the indicator's own close signal instead in that case.
 
 ## 7. Running on port 80
 
@@ -342,13 +400,17 @@ system startup, with "Run whether user is logged on or not" checked.
 - **Open only the port you need** in the Windows Firewall (and your
   VPS provider's firewall/security group), pointing at this app. See
   `Diagnostic.md` if requests aren't reaching the app — a misconfigured
-  or missing firewall rule is the most common cause.
+  or missing firewall rule is the most common cause. `Diagnostic.md`
+  also covers scoping inbound port 80 to TradingView's published IPs
+  once you're done testing, to cut down on internet scan noise.
 - The GUID protects against random internet traffic hitting the
   endpoint, but it travels in plain text if you use `http://`. If you
   want it encrypted in transit, put a reverse proxy in front (IIS with
   a URL Rewrite/ARR module, or Caddy/nginx) with a free TLS cert (e.g.
   via Let's Encrypt/win-acme) and point TradingView at the `https://`
-  URL instead, forwarding to this app's local port.
+  URL instead, forwarding to this app's local port. (This would also
+  let you switch the Telegram "Close" button to real-time webhook
+  delivery instead of long-polling, if you ever want that.)
 - Treat the GUID like a password — don't post it anywhere public, and
   rotate it if you ever suspect it's leaked (just edit `config.json`,
   no restart needed).
