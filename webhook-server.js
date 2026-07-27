@@ -348,10 +348,17 @@ async function closeTradeLockerPosition(token, accountId, accNum, positionId) {
   }
 }
 
-async function closeAllTradeLockerPositions() {
+async function closeAllTradeLockerPositions(rawSymbol) {
   let token = await getTradeLockerToken();
   const { accountId, accNum } = await getTradeLockerAccountDetails(token);
-  const positions = await getTradeLockerOpenPositions(token, accountId, accNum);
+  let positions = await getTradeLockerOpenPositions(token, accountId, accNum);
+
+  let instrumentName;
+  if (rawSymbol) {
+    const instrument = await findTradeLockerInstrument(token, accountId, accNum, rawSymbol);
+    instrumentName = instrument.instrumentName;
+    positions = positions.filter((p) => String(p.tradableInstrumentId) === String(instrument.tradableInstrumentId));
+  }
 
   const closed = [];
   for (const p of positions) {
@@ -360,7 +367,7 @@ async function closeAllTradeLockerPositions() {
       throw new Error(`Could not determine positionId from position data — check the "Mapped positions" log line and update the field mapping. Raw position: ${JSON.stringify(p)}`);
     }
     await closeTradeLockerPosition(token, accountId, accNum, positionId);
-    closed.push({ positionId, instrument: p.instrument ?? p.name ?? p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
+    closed.push({ positionId, instrument: instrumentName ?? p.instrument ?? p.name ?? p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
   }
   return closed;
 }
@@ -492,13 +499,15 @@ async function createTradeLockerTrade(payload) {
   const placeOrderCall = async (authToken) => {
     const { accountId, accNum } = await getTradeLockerAccountDetails(authToken);
 
-    // Max concurrent open trades check — reject new trades once the limit is reached.
-    const openPositions = await getTradeLockerOpenPositions(authToken, accountId, accNum);
-    if (openPositions.length >= config.maxOpenTrades) {
-      throw new Error(`Max open trades reached (${openPositions.length}/${config.maxOpenTrades}) — new trade rejected`);
-    }
-
     const { tradableInstrumentId, routeId, infoRouteId, instrumentName, contractSize, minQty } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
+
+    // Max concurrent open trades check — per instrument, not account-wide.
+    // A GBPUSD position open doesn't block a new BTCUSD trade, for example.
+    const openPositions = await getTradeLockerOpenPositions(authToken, accountId, accNum);
+    const openForSymbol = openPositions.filter((p) => String(p.tradableInstrumentId) === String(tradableInstrumentId));
+    if (openForSymbol.length >= config.maxOpenTrades) {
+      throw new Error(`Max open trades reached for ${instrumentName} (${openForSymbol.length}/${config.maxOpenTrades}) — new trade rejected`);
+    }
 
     // Market order — entry is the current live price, fetched from the quotes endpoint.
     // Quotes require the INFO routeId, not the TRADE routeId used for order placement.
@@ -745,12 +754,13 @@ const server = http.createServer(async (req, res) => {
   // -------------------------------------------------------------------
   } else if (shouldClosePositions) {
     try {
-      const closed = await closeAllTradeLockerPositions();
-      log(`Closed ${closed.length} TradeLocker position(s): ${JSON.stringify(closed)}`);
+      const closeSymbol = payload.symbol ?? payload.Symbol ?? payload.ticker ?? payload.Ticker;
+      const closed = await closeAllTradeLockerPositions(closeSymbol);
+      log(`Closed ${closed.length} TradeLocker position(s)${closeSymbol ? ` for ${closeSymbol}` : ''}: ${JSON.stringify(closed)}`);
 
       const telegramText = closed.length > 0
         ? ['🔒 TradeLocker Position(s) Closed', ...closed.map((p) => `${p.instrument} ${p.side} qty ${p.qty} (positionId ${p.positionId})`)].join('\n')
-        : 'ℹ️ /close called — no open position to close';
+        : `ℹ️ Close called${closeSymbol ? ` for ${closeSymbol}` : ''} — no open position to close`;
 
       try {
         await sendTelegramMessage(telegramText);
