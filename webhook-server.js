@@ -676,6 +676,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // A /trade call with no "type" field is treated as a close request, so a
+  // single TradingView alert (one fixed webhook URL) can drive both opens
+  // and closes — the payload shape decides which, not the URL.
+  const hasType = payload.type !== undefined && payload.type !== null && payload.type !== '';
+  const shouldOpenTrade = isTradePath && hasType;
+  const shouldClosePositions = isClosePath || (isTradePath && !hasType);
+
   // -------------------------------------------------------------------
   // Telegram Webhook Relay Endpoint
   // -------------------------------------------------------------------
@@ -695,7 +702,7 @@ const server = http.createServer(async (req, res) => {
   // -------------------------------------------------------------------
   // TradeLocker Order Execution Endpoint
   // -------------------------------------------------------------------
-  } else if (isTradePath) {
+  } else if (shouldOpenTrade) {
     try {
       const tradeResult = await createTradeLockerTrade(payload);
       const isDry = tradeResult.dryRun;
@@ -736,7 +743,7 @@ const server = http.createServer(async (req, res) => {
   // -------------------------------------------------------------------
   // TradeLocker Close Position Endpoint
   // -------------------------------------------------------------------
-  } else if (isClosePath) {
+  } else if (shouldClosePositions) {
     try {
       const closed = await closeAllTradeLockerPositions();
       log(`Closed ${closed.length} TradeLocker position(s): ${JSON.stringify(closed)}`);
