@@ -191,3 +191,85 @@ prevention agents that can transparently intercept and reset inbound
 connections on common ports, independent of Windows Firewall. If none of
 the above resolves it, check what security software is installed on the
 VPS beyond Windows Firewall itself.
+
+---
+
+## 8. Switching between testing (broad) and production (scoped) firewall rules
+
+Use the **broad rule** (any source IP) while actively testing with
+Postman/curl from your own machine. Switch to the **scoped rule**
+(TradingView's published IPs only, plus your own) once testing is done
+and the alert is live, to reduce exposure to internet scanning noise and
+unauthorized requests.
+
+Only one of these two should be active on port 80 at a time — having
+both enabled simultaneously doesn't combine their restrictions; the
+broader "Allow Any" rule silently permits everything regardless of the
+scoped rule also being present. Always confirm only one is `Enabled:
+True` after switching (see the check at the end of this section).
+
+### 8a. Testing mode (broad rule)
+
+```powershell
+Set-NetFirewallRule -DisplayName "Allow HTTP 80" -RemoteAddress Any -Enabled True
+```
+
+If a separate scoped rule already exists from a previous production
+period, disable it so it isn't redundantly active:
+
+```powershell
+Get-NetFirewallRule -DisplayName "Allow HTTP 80 - TradingView Only" -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+```
+
+Test as normal from Postman/curl.
+
+### 8b. Production mode (TradingView-scoped rule)
+
+TradingView's published webhook-sending IPs (see
+https://www.tradingview.com/support/solutions/43000529348-how-to-configure-webhook-alerts/
+— recheck this page periodically, as the list isn't guaranteed
+permanent):
+
+```
+52.89.214.238
+34.212.75.30
+54.218.53.128
+52.32.178.7
+```
+
+Scope the existing rule down to just these, plus your own IP (so you can
+still reach it directly if needed):
+
+```powershell
+Set-NetFirewallRule -DisplayName "Allow HTTP 80" -RemoteAddress 52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7,<your-ip> -Enabled True
+```
+
+If you'd rather keep testing and production as two separate named rules
+instead of editing one rule back and forth, create the scoped rule once:
+
+```powershell
+New-NetFirewallRule -DisplayName "Allow HTTP 80 - TradingView Only" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow -Profile Any -RemoteAddress 52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7,<your-ip>
+```
+
+then toggle between the two with `Enable-NetFirewallRule` /
+`Disable-NetFirewallRule` on each by name instead of editing scope each
+time:
+
+```powershell
+# Switch to production (scoped):
+Disable-NetFirewallRule -DisplayName "Allow HTTP 80"
+Enable-NetFirewallRule -DisplayName "Allow HTTP 80 - TradingView Only"
+
+# Switch back to testing (broad):
+Disable-NetFirewallRule -DisplayName "Allow HTTP 80 - TradingView Only"
+Enable-NetFirewallRule -DisplayName "Allow HTTP 80"
+```
+
+### 8c. Verify only one rule is active
+
+```powershell
+Get-NetFirewallRule -Direction Inbound | Where-Object { ($_ | Get-NetFirewallPortFilter).LocalPort -eq 80 } | Select-Object DisplayName, Enabled, Action
+```
+
+Exactly one row should show `Enabled: True` for port 80 — whichever mode
+you intend to be in.
