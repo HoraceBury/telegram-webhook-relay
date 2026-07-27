@@ -84,6 +84,38 @@ async function sendTelegramMessage(text) {
   }
 }
 
+async function sendTelegramMessageWithButton(text, buttonText, callbackData) {
+  const url = `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: config.telegramChatId,
+      text,
+      reply_markup: { inline_keyboard: [[{ text: buttonText, callback_data: callbackData }]] },
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Telegram API returned ${resp.status}: ${body}`);
+  }
+}
+
+async function answerTelegramCallback(callbackQueryId, text) {
+  const url = `https://api.telegram.org/bot${config.telegramBotToken}/answerCallbackQuery`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text.slice(0, 200) }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (err) {
+    log(`Failed to answer Telegram callback query: ${err.message}`);
+  }
+}
+
 function readBody(req, maxBytes = 1_000_000) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -370,6 +402,84 @@ async function closeAllTradeLockerPositions(rawSymbol) {
     closed.push({ positionId, instrument: instrumentName ?? p.instrument ?? p.name ?? p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
   }
   return closed;
+}
+
+// -------------------------------------------------------------------
+// Telegram "Close Trade" Button Handling (long-polling)
+// -------------------------------------------------------------------
+// Telegram delivers button presses as "callback queries." Real-time push
+// delivery (a Telegram-side webhook) requires an HTTPS URL, which this
+// server doesn't have, so instead we periodically ask Telegram for new
+// updates (long polling) — no inbound exposure or TLS needed.
+//
+// Only one polling session runs at a time (Telegram's getUpdates doesn't
+// support overlapping concurrent calls with the same offset — a second
+// call while one is pending returns a 409 Conflict). A session is up to
+// 10 polls of 30s each (~5 minutes), then it stops. Starting a trade
+// triggers a session only if one isn't already running; any "Close"
+// button pressed while a session is active works, regardless of which
+// trade's message it came from.
+
+let tgUpdateOffset = 0;
+let tgPollingActive = false;
+const TG_MAX_POLLS = 10; // 10 x 30s long-polls ≈ 5 minutes per session
+
+async function startTelegramPollingSession() {
+  if (tgPollingActive) return; // a session is already running — don't overlap
+  tgPollingActive = true;
+  log('Telegram polling session started (up to 10 polls, ~5 minutes).');
+
+  try {
+    for (let pollCount = 0; pollCount < TG_MAX_POLLS; pollCount++) {
+      try {
+        const url = `https://api.telegram.org/bot${config.telegramBotToken}/getUpdates?timeout=30&offset=${tgUpdateOffset}&allowed_updates=%5B%22callback_query%22%5D`;
+        const resp = await fetch(url, { signal: AbortSignal.timeout(35_000) });
+        if (!resp.ok) {
+          const text = await resp.text();
+          log(`Telegram getUpdates failed (${resp.status}): ${text}`);
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
+
+        const data = await resp.json();
+        for (const update of data.result || []) {
+          tgUpdateOffset = update.update_id + 1;
+
+          const cb = update.callback_query;
+          if (!cb || !cb.data || !cb.data.startsWith('close:')) continue;
+
+          const symbol = cb.data.slice('close:'.length);
+          log(`Telegram "Close" button pressed for ${symbol}`);
+
+          try {
+            const closed = await closeAllTradeLockerPositions(symbol);
+            const resultText = closed.length > 0
+              ? `Closed ${closed.length} position(s) on ${symbol}`
+              : `No open position on ${symbol}`;
+            await answerTelegramCallback(cb.id, resultText);
+
+            const telegramText = closed.length > 0
+              ? ['🔒 Position Closed (via button)', ...closed.map((p) => `${p.instrument} ${p.side} qty ${p.qty} (positionId ${p.positionId})`)].join('\n')
+              : `ℹ️ Close button pressed for ${symbol} — no open position to close`;
+            await sendTelegramMessage(telegramText);
+            log(`Closed ${closed.length} position(s) for ${symbol} via Telegram button.`);
+          } catch (err) {
+            await answerTelegramCallback(cb.id, `Failed: ${err.message}`);
+            log(`Failed to close ${symbol} via Telegram button: ${err.message}`);
+            try {
+              await sendTelegramMessage(`❌ Close via button FAILED for ${symbol}\nError: ${err.message}`);
+            } catch (_) {}
+          }
+        }
+      } catch (err) {
+        log(`Telegram polling error: ${err.message}`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+  } finally {
+    tgPollingActive = false;
+    log('Telegram polling session ended (5-minute window elapsed).');
+  }
 }
 
 async function getTradeLockerQuote(token, accountId, accNum, tradableInstrumentId, routeId) {
@@ -735,6 +845,17 @@ const server = http.createServer(async (req, res) => {
         log(`Trade execution alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
       } catch (tgErr) {
         log(`Failed to send trade execution alert to Telegram: ${tgErr.message}`);
+      }
+
+      try {
+        await sendTelegramMessageWithButton(
+          `Kill switch for ${tradeResult.instrumentName}`,
+          `🔴 Close ${tradeResult.instrumentName}`,
+          `close:${tradeResult.instrumentName}`
+        );
+        startTelegramPollingSession(); // fire-and-forget; no-op if a session is already active
+      } catch (tgErr) {
+        log(`Failed to send close-trade button to Telegram: ${tgErr.message}`);
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
