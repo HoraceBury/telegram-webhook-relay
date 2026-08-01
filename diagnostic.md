@@ -273,3 +273,9 @@ Get-NetFirewallRule -Direction Inbound | Where-Object { ($_ | Get-NetFirewallPor
 
 Exactly one row should show `Enabled: True` for port 80 — whichever mode
 you intend to be in.
+
+### 8d. Fully remove a rule
+
+```powershell
+Get-NetFirewallRule -DisplayName "Allow HTTP 80" | Remove-NetFirewallRule
+```
