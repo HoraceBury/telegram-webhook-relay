@@ -386,10 +386,15 @@ async function closeAllTradeLockerPositions(rawSymbol) {
   let positions = await getTradeLockerOpenPositions(token, accountId, accNum);
 
   let instrumentName;
+  let scopedInstrumentId;
   if (rawSymbol) {
     const instrument = await findTradeLockerInstrument(token, accountId, accNum, rawSymbol);
     instrumentName = instrument.instrumentName;
+    scopedInstrumentId = instrument.tradableInstrumentId;
+    log(`Resolved instrument for CLOSE: ${instrumentName} (tradableInstrumentId=${scopedInstrumentId}) — scoping close to this instrument only.`);
     positions = positions.filter((p) => String(p.tradableInstrumentId) === String(instrument.tradableInstrumentId));
+  } else {
+    log(`CLOSE request has no symbol scope — closing ALL open positions account-wide (${positions.length} found).`);
   }
 
   const closed = [];
@@ -398,8 +403,9 @@ async function closeAllTradeLockerPositions(rawSymbol) {
     if (!positionId) {
       throw new Error(`Could not determine positionId from position data — check the "Mapped positions" log line and update the field mapping. Raw position: ${JSON.stringify(p)}`);
     }
+    log(`Closing position ${positionId} on instrument ${p.tradableInstrumentId} (${instrumentName ?? 'unscoped'})`);
     await closeTradeLockerPosition(token, accountId, accNum, positionId);
-    closed.push({ positionId, instrument: instrumentName ?? p.instrument ?? p.name ?? p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
+    closed.push({ positionId, instrument: instrumentName ?? p.instrument ?? p.name ?? p.tradableInstrumentId, tradableInstrumentId: p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
   }
   return closed;
 }
@@ -610,6 +616,7 @@ async function createTradeLockerTrade(payload) {
     const { accountId, accNum } = await getTradeLockerAccountDetails(authToken);
 
     const { tradableInstrumentId, routeId, infoRouteId, instrumentName, contractSize, minQty } = await findTradeLockerInstrument(authToken, accountId, accNum, rawSymbol);
+    log(`Resolved instrument for OPEN: ${instrumentName} (tradableInstrumentId=${tradableInstrumentId})`);
 
     // Max concurrent open trades check — per instrument, not account-wide.
     // A GBPUSD position open doesn't block a new BTCUSD trade, for example.
@@ -801,6 +808,16 @@ const server = http.createServer(async (req, res) => {
   const hasType = payload.type !== undefined && payload.type !== null && payload.type !== '';
   const shouldOpenTrade = isTradePath && hasType;
   const shouldClosePositions = isClosePath || (isTradePath && !hasType);
+
+  if (shouldOpenTrade || shouldClosePositions) {
+    const requestSymbol = payload.symbol ?? payload.Symbol ?? payload.ticker ?? payload.Ticker;
+    const intent = shouldOpenTrade ? `OPEN ${String(payload.type).toUpperCase()}` : 'CLOSE';
+    if (shouldClosePositions && !requestSymbol) {
+      log(`WARNING: ${intent} request on ${requestPath} has no "symbol" field — this will close ALL open positions account-wide, not one instrument. Symbol: (none)`);
+    } else {
+      log(`${intent} request on ${requestPath} — Symbol: ${requestSymbol ?? '(none)'}`);
+    }
+  }
 
   // -------------------------------------------------------------------
   // Telegram Webhook Relay Endpoint
