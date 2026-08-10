@@ -67,7 +67,155 @@ fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => {
 });
 
 // -------------------------------------------------------------------
-// Telegram API Integration
+// Trade Context Persistence (entry/sl per open position, for R:R calc)
+// -------------------------------------------------------------------
+// Stores the entry and SL actually used to open each live trade, keyed by
+// tradableInstrumentId, so a later close can compute an R-multiple result
+// (SL hit = -1.0, full TP = +1.0, halfway to TP = +0.5, etc.). Persisted to
+// disk so a server/app restart doesn't lose it.
+
+const TRADE_CONTEXT_PATH = path.join(__dirname, 'trade-context.json');
+const openTradeContext = new Map(); // key: String(tradableInstrumentId) -> { instrumentName, side, entry, sl, savedAt }
+
+function saveTradeContext() {
+  try {
+    fs.writeFileSync(TRADE_CONTEXT_PATH, JSON.stringify(Object.fromEntries(openTradeContext), null, 2));
+  } catch (err) {
+    log(`Failed to save trade-context.json: ${err.message}`);
+  }
+}
+
+function setTradeContext(tradableInstrumentId, data) {
+  openTradeContext.set(String(tradableInstrumentId), { ...data, savedAt: new Date().toISOString() });
+  saveTradeContext();
+}
+
+function clearTradeContext(tradableInstrumentId) {
+  if (openTradeContext.delete(String(tradableInstrumentId))) {
+    saveTradeContext();
+  }
+}
+
+function loadTradeContext() {
+  if (!fs.existsSync(TRADE_CONTEXT_PATH)) {
+    log('No trade-context.json found on disk — starting with empty R:R tracking.');
+    return;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(TRADE_CONTEXT_PATH, 'utf8'));
+    for (const [key, value] of Object.entries(parsed)) {
+      openTradeContext.set(key, value);
+    }
+    if (openTradeContext.size === 0) {
+      log('trade-context.json loaded but was empty.');
+    } else {
+      log(`Loaded trade context from disk for ${openTradeContext.size} instrument(s):`);
+      for (const [key, value] of openTradeContext.entries()) {
+        log(`  - ${value.instrumentName ?? key} (tradableInstrumentId=${key}): side=${value.side}, entry=${value.entry}, sl=${value.sl}, savedAt=${value.savedAt}`);
+      }
+    }
+  } catch (err) {
+    log(`Failed to load trade-context.json: ${err.message} — starting with empty R:R tracking.`);
+  }
+}
+
+// Compares loaded (persisted) context against TradeLocker's actual live open
+// positions. Stale entries (no matching live position — e.g. it closed while
+// the app was down) are removed. Live positions with no stored context are
+// logged as a warning, since R:R won't be computable for those if they close.
+async function corroborateTradeContextWithLivePositions() {
+  try {
+    const token = await getTradeLockerToken();
+    const { accountId, accNum } = await getTradeLockerAccountDetails(token);
+    const livePositions = await getTradeLockerOpenPositions(token, accountId, accNum);
+    const liveInstrumentIds = new Set(livePositions.map((p) => String(p.tradableInstrumentId)));
+
+    for (const [key, value] of Array.from(openTradeContext.entries())) {
+      if (!liveInstrumentIds.has(key)) {
+        log(`STALE trade context: ${value.instrumentName ?? key} (tradableInstrumentId=${key}) has no matching live open position — removing stored context.`);
+        openTradeContext.delete(key);
+      } else {
+        log(`Corroborated trade context: ${value.instrumentName ?? key} (tradableInstrumentId=${key}) matches a live open position.`);
+      }
+    }
+    saveTradeContext();
+
+    for (const p of livePositions) {
+      const key = String(p.tradableInstrumentId);
+      if (!openTradeContext.has(key)) {
+        log(`WARNING: live open position on tradableInstrumentId=${key} (positionId=${p.positionId ?? p.id}) has no stored entry/sl context — R:R result won't be available if this closes.`);
+      }
+    }
+  } catch (err) {
+    log(`Failed to corroborate trade context with live positions: ${err.message}`);
+  }
+}
+
+// Runs periodically (every 15 minutes, see the setInterval near server
+// startup) while trades are being tracked. Unlike the one-time startup
+// corroboration above, this actively notifies Telegram when it finds a
+// tracked trade has closed outside the app (SL/TP hit at the broker, or
+// closed manually) — the whole point being you find out even if the app
+// missed the close signal for some reason.
+async function checkForExternallyClosedTrades() {
+  if (openTradeContext.size === 0) {
+    log('Reconciliation check: no tracked open trades — skipping.');
+    return;
+  }
+
+  try {
+    const token = await getTradeLockerToken();
+    const { accountId, accNum } = await getTradeLockerAccountDetails(token);
+    const livePositions = await getTradeLockerOpenPositions(token, accountId, accNum);
+    const liveInstrumentIds = new Set(livePositions.map((p) => String(p.tradableInstrumentId)));
+
+    for (const [key, ctx] of Array.from(openTradeContext.entries())) {
+      if (liveInstrumentIds.has(key)) continue; // still open — nothing to do
+
+      log(`Reconciliation: tracked trade on ${ctx.instrumentName} (tradableInstrumentId=${key}) is no longer open on the broker — closed externally (SL/TP hit, or closed outside this app).`);
+
+      let resultR = null;
+      try {
+        const instrument = await findTradeLockerInstrument(token, accountId, accNum, ctx.instrumentName);
+        const { ask, bid } = await getTradeLockerQuote(token, accountId, accNum, instrument.tradableInstrumentId, instrument.infoRouteId);
+        const estClosePrice = ctx.side === 'buy' ? bid : ask;
+        resultR = calculateRMultiple(ctx.side, ctx.entry, ctx.sl, estClosePrice);
+      } catch (err) {
+        log(`Could not estimate R:R for externally-closed ${ctx.instrumentName}: ${err.message}`);
+      }
+
+      const resultText = (resultR !== null && resultR !== undefined) ? ` — Estimated Result: ${resultR >= 0 ? '+' : ''}${resultR.toFixed(1)}` : '';
+      try {
+        await sendTelegramMessage(`⚠️ ${ctx.instrumentName} position closed outside the app (SL/TP hit, or closed manually)${resultText}`);
+      } catch (tgErr) {
+        log(`Failed to send reconciliation Telegram alert: ${tgErr.message}`);
+      }
+
+      clearTradeContext(key);
+    }
+  } catch (err) {
+    log(`Reconciliation check failed: ${err.message}`);
+  }
+}
+
+function calculateRMultiple(side, entry, sl, closePrice) {
+  if (entry === undefined || sl === undefined || closePrice === undefined || entry === null || sl === null || closePrice === null) return null;
+  const risk = side === 'sell' ? (sl - entry) : (entry - sl);
+  if (!risk) return null;
+  const raw = side === 'sell' ? (entry - closePrice) : (closePrice - entry);
+  return raw / risk;
+}
+
+function formatClosedPositionLine(p) {
+  const resultText = (p.resultR !== null && p.resultR !== undefined)
+    ? ` — Result: ${p.resultR >= 0 ? '+' : ''}${p.resultR.toFixed(1)}`
+    : '';
+  return `${p.instrument} ${p.side} qty ${p.qty} (positionId ${p.positionId})${resultText}`;
+}
+
+loadTradeContext();
+
+
 // -------------------------------------------------------------------
 
 async function sendTelegramMessage(text) {
@@ -387,14 +535,29 @@ async function closeAllTradeLockerPositions(rawSymbol) {
 
   let instrumentName;
   let scopedInstrumentId;
+  let scopedInfoRouteId;
   if (rawSymbol) {
     const instrument = await findTradeLockerInstrument(token, accountId, accNum, rawSymbol);
     instrumentName = instrument.instrumentName;
     scopedInstrumentId = instrument.tradableInstrumentId;
+    scopedInfoRouteId = instrument.infoRouteId;
     log(`Resolved instrument for CLOSE: ${instrumentName} (tradableInstrumentId=${scopedInstrumentId}) — scoping close to this instrument only.`);
     positions = positions.filter((p) => String(p.tradableInstrumentId) === String(instrument.tradableInstrumentId));
   } else {
     log(`CLOSE request has no symbol scope — closing ALL open positions account-wide (${positions.length} found).`);
+  }
+
+  // Fetch a live quote once for the scoped instrument, used as the estimated
+  // close price for the R-multiple calculation. Only available when the
+  // close is symbol-scoped (an account-wide close skips R:R — no single
+  // instrument to quote).
+  let closeQuote;
+  if (rawSymbol && scopedInstrumentId && scopedInfoRouteId) {
+    try {
+      closeQuote = await getTradeLockerQuote(token, accountId, accNum, scopedInstrumentId, scopedInfoRouteId);
+    } catch (err) {
+      log(`Could not fetch close-estimate quote for ${instrumentName}: ${err.message} — R:R result will be omitted.`);
+    }
   }
 
   const closed = [];
@@ -404,8 +567,18 @@ async function closeAllTradeLockerPositions(rawSymbol) {
       throw new Error(`Could not determine positionId from position data — check the "Mapped positions" log line and update the field mapping. Raw position: ${JSON.stringify(p)}`);
     }
     log(`Closing position ${positionId} on instrument ${p.tradableInstrumentId} (${instrumentName ?? 'unscoped'})`);
+
+    const ctx = openTradeContext.get(String(p.tradableInstrumentId));
+    let resultR = null;
+    if (ctx && closeQuote) {
+      // Closing a buy = selling at bid; closing a sell = buying at ask.
+      const estClosePrice = p.side === 'buy' ? closeQuote.bid : closeQuote.ask;
+      resultR = calculateRMultiple(p.side, ctx.entry, ctx.sl, estClosePrice);
+    }
+
     await closeTradeLockerPosition(token, accountId, accNum, positionId);
-    closed.push({ positionId, instrument: instrumentName ?? p.instrument ?? p.name ?? p.tradableInstrumentId, tradableInstrumentId: p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen });
+    clearTradeContext(p.tradableInstrumentId);
+    closed.push({ positionId, instrument: instrumentName ?? p.instrument ?? p.name ?? p.tradableInstrumentId, tradableInstrumentId: p.tradableInstrumentId, side: p.side, qty: p.lots ?? p.qty ?? p.qtyOpen, resultR });
   }
   return closed;
 }
@@ -465,7 +638,7 @@ async function startTelegramPollingSession() {
             await answerTelegramCallback(cb.id, resultText);
 
             const telegramText = closed.length > 0
-              ? ['🔒 Position Closed (via button)', ...closed.map((p) => `${p.instrument} ${p.side} qty ${p.qty} (positionId ${p.positionId})`)].join('\n')
+              ? ['🔒 Position Closed (via button)', ...closed.map(formatClosedPositionLine)].join('\n')
               : `ℹ️ Close button pressed for ${symbol} — no open position to close`;
             await sendTelegramMessage(telegramText);
             log(`Closed ${closed.length} position(s) for ${symbol} via Telegram button.`);
@@ -701,6 +874,11 @@ async function createTradeLockerTrade(payload) {
       orderId = result.d?.orderId ?? result.orderId ?? 'Unknown';
     }
 
+    if (!isDryRun) {
+      setTradeContext(tradableInstrumentId, { instrumentName, side, entry: entryNum, sl: slNum });
+      log(`Stored trade context for R:R tracking: ${instrumentName} side=${side} entry=${entryNum} sl=${slNum}`);
+    }
+
     return {
       orderId,
       instrumentName,
@@ -897,7 +1075,7 @@ const server = http.createServer(async (req, res) => {
       log(`Closed ${closed.length} TradeLocker position(s)${closeSymbol ? ` for ${closeSymbol}` : ''}: ${JSON.stringify(closed)}`);
 
       const telegramText = closed.length > 0
-        ? ['🔒 TradeLocker Position(s) Closed', ...closed.map((p) => `${p.instrument} ${p.side} qty ${p.qty} (positionId ${p.positionId})`)].join('\n')
+        ? ['🔒 TradeLocker Position(s) Closed', ...closed.map(formatClosedPositionLine)].join('\n')
         : `ℹ️ Close called${closeSymbol ? ` for ${closeSymbol}` : ''} — no open position to close`;
 
       try {
@@ -925,6 +1103,12 @@ const server = http.createServer(async (req, res) => {
 server.listen(config.port, config.ip, () => {
   log(`Webhook server listening on http://${config.ip}:${config.port} (Webhook: ${config.webhookPath}, Trade: ${config.tradePath}, Health: ${config.healthPath})`);
 });
+
+corroborateTradeContextWithLivePositions();
+
+const RECONCILIATION_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+setInterval(checkForExternallyClosedTrades, RECONCILIATION_INTERVAL_MS);
+log('Reconciliation check scheduled every 15 minutes.');
 
 process.on('uncaughtException', (err) => {
   log(`Uncaught exception: ${err.stack || err.message}`);
