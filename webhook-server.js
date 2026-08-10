@@ -871,7 +871,18 @@ async function createTradeLockerTrade(payload) {
       }
 
       result = await resp.json();
-      orderId = result.d?.orderId ?? result.orderId ?? 'Unknown';
+
+      // TradeLocker can return HTTP 200 with a logical failure in the body
+      // (e.g. {"s":"error","errmsg":"TP price for the order is not valid."}).
+      // resp.ok alone doesn't catch this — check the body's own status too.
+      if (result.s === 'error') {
+        throw new Error(`TradeLocker rejected the order: ${result.errmsg || JSON.stringify(result)}`);
+      }
+
+      orderId = result.d?.orderId ?? result.orderId;
+      if (!orderId) {
+        throw new Error(`TradeLocker response did not contain an orderId — treating as a failed order. Response: ${JSON.stringify(result)}`);
+      }
     }
 
     if (!isDryRun) {
