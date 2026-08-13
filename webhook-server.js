@@ -309,6 +309,27 @@ function getTradeLockerBaseUrl(cfg) {
   return env;
 }
 
+// Wraps fetch() for TradeLocker calls, retrying on 429 (Too Many Requests)
+// with exponential backoff + jitter, honoring Retry-After when present. A
+// burst of near-simultaneous open/close requests (e.g. duplicate/retried
+// webhook deliveries) previously tripped TradeLocker's rate limit and
+// surfaced immediately as a request failure. Each attempt gets its own
+// fresh timeout signal rather than reusing one across retries.
+async function tlFetch(url, options = {}, { retries = 3, timeoutMs = 10_000 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const resp = await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+    if (resp.status !== 429 || attempt >= retries) {
+      return resp;
+    }
+    const retryAfterSeconds = Number(resp.headers.get('retry-after'));
+    const backoffMs = retryAfterSeconds > 0
+      ? retryAfterSeconds * 1000
+      : Math.min(8000, 500 * 2 ** attempt) + Math.floor(Math.random() * 250);
+    log(`TradeLocker request rate-limited (429): ${url} — retrying in ${backoffMs}ms (attempt ${attempt + 1}/${retries}).`);
+    await new Promise((r) => setTimeout(r, backoffMs));
+  }
+}
+
 async function getTradeLockerToken(forceRefresh = false) {
   if (!forceRefresh && tlAuthToken && Date.now() < tlTokenExpiresAt - 60_000) {
     return tlAuthToken;
@@ -330,11 +351,10 @@ async function getTradeLockerToken(forceRefresh = false) {
     throw new Error('TradeLocker credentials (tradelockerEmail, tradelockerPassword, tradelockerServer) are not properly set in config.json');
   }
 
-  const resp = await fetch(`${baseUrl}/auth/jwt/token`, {
+  const resp = await tlFetch(`${baseUrl}/auth/jwt/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password, server }),
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -366,12 +386,11 @@ async function getTradeLockerAccountDetails(token) {
   }
 
   const baseUrl = getTradeLockerBaseUrl(config);
-  const resp = await fetch(`${baseUrl}/auth/jwt/all-accounts`, {
+  const resp = await tlFetch(`${baseUrl}/auth/jwt/all-accounts`, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${token}`,
     },
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -399,13 +418,12 @@ async function getTradeLockerAccountDetails(token) {
 async function getTradeLockerAccountBalance(token, accountId, accNum) {
   const baseUrl = getTradeLockerBaseUrl(config);
   try {
-    const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/state`, {
+    const resp = await tlFetch(`${baseUrl}/trade/accounts/${accountId}/state`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,
         'accNum': String(accNum),
       },
-      signal: AbortSignal.timeout(10_000),
     });
     if (resp.ok) {
       const data = await resp.json();
@@ -417,10 +435,9 @@ async function getTradeLockerAccountBalance(token, accountId, accNum) {
   } catch (_) {}
 
   try {
-    const respAll = await fetch(`${baseUrl}/auth/jwt/all-accounts`, {
+    const respAll = await tlFetch(`${baseUrl}/auth/jwt/all-accounts`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${token}` },
-      signal: AbortSignal.timeout(10_000),
     });
     if (respAll.ok) {
       const dataAll = await respAll.json();
@@ -443,13 +460,12 @@ let tlConfigCache = null;
 async function getTradeLockerConfig(token, accNum) {
   if (tlConfigCache) return tlConfigCache;
   const baseUrl = getTradeLockerBaseUrl(config);
-  const resp = await fetch(`${baseUrl}/trade/config`, {
+  const resp = await tlFetch(`${baseUrl}/trade/config`, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${token}`,
       'accNum': String(accNum),
     },
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -482,13 +498,12 @@ function mapRowsToObjects(rows, columnsConfig) {
 
 async function getTradeLockerOpenPositions(token, accountId, accNum) {
   const baseUrl = getTradeLockerBaseUrl(config);
-  const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/positions`, {
+  const resp = await tlFetch(`${baseUrl}/trade/accounts/${accountId}/positions`, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${token}`,
       'accNum': String(accNum),
     },
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -511,7 +526,7 @@ async function getTradeLockerOpenPositions(token, accountId, accNum) {
 
 async function closeTradeLockerPosition(token, accountId, accNum, positionId) {
   const baseUrl = getTradeLockerBaseUrl(config);
-  const resp = await fetch(`${baseUrl}/trade/positions/${positionId}`, {
+  const resp = await tlFetch(`${baseUrl}/trade/positions/${positionId}`, {
     method: 'DELETE',
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -519,7 +534,6 @@ async function closeTradeLockerPosition(token, accountId, accNum, positionId) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ qty: 0 }), // qty: 0 = fully close the position
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok && resp.status !== 204) {
@@ -631,7 +645,7 @@ async function startTelegramPollingSession() {
           log(`Telegram "Close" button pressed for ${symbol}`);
 
           try {
-            const closed = await closeAllTradeLockerPositions(symbol);
+            const closed = await runExclusive(symbol, () => closeAllTradeLockerPositions(symbol));
             const resultText = closed.length > 0
               ? `Closed ${closed.length} position(s) on ${symbol}`
               : `No open position on ${symbol}`;
@@ -663,13 +677,12 @@ async function startTelegramPollingSession() {
 
 async function getTradeLockerQuote(token, accountId, accNum, tradableInstrumentId, routeId) {
   const baseUrl = getTradeLockerBaseUrl(config);
-  const resp = await fetch(`${baseUrl}/trade/quotes?tradableInstrumentId=${tradableInstrumentId}&routeId=${routeId}`, {
+  const resp = await tlFetch(`${baseUrl}/trade/quotes?tradableInstrumentId=${tradableInstrumentId}&routeId=${routeId}`, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${token}`,
       'accNum': String(accNum),
     },
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -693,13 +706,12 @@ async function getTradeLockerQuote(token, accountId, accNum, tradableInstrumentI
 
 async function findTradeLockerInstrument(token, accountId, accNum, rawSymbol) {
   const baseUrl = getTradeLockerBaseUrl(config);
-  const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/instruments`, {
+  const resp = await tlFetch(`${baseUrl}/trade/accounts/${accountId}/instruments`, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${token}`,
       'accNum': String(accNum),
     },
-    signal: AbortSignal.timeout(10_000),
   });
 
   if (!resp.ok) {
@@ -850,7 +862,7 @@ async function createTradeLockerTrade(payload) {
       log(`[DRY-RUN] Trade order simulated (not sent to broker). Order ID: ${orderId}`);
     } else {
       const baseUrl = getTradeLockerBaseUrl(config);
-      const resp = await fetch(`${baseUrl}/trade/accounts/${accountId}/orders`, {
+      const resp = await tlFetch(`${baseUrl}/trade/accounts/${accountId}/orders`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${authToken}`,
@@ -858,7 +870,6 @@ async function createTradeLockerTrade(payload) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(orderBody),
-        signal: AbortSignal.timeout(10_000),
       });
 
       if (resp.status === 401) {
@@ -914,6 +925,26 @@ async function createTradeLockerTrade(payload) {
     }
     throw err;
   }
+}
+
+// -------------------------------------------------------------------
+// Per-instrument request serialization
+// -------------------------------------------------------------------
+// TradingView can deliver an open and a close for the same instrument
+// within milliseconds of each other (two independent alert() calls firing
+// off the same bar close, or retried deliveries). Each request used to
+// independently fetch "current open positions" and act on it — two
+// overlapping requests could both read the same stale snapshot and both
+// proceed. Routing every open/close for a given symbol through here forces
+// them to run one at a time, in arrival order, instead of racing.
+const instrumentLocks = new Map(); // symbolKey -> tail promise of that symbol's chain
+
+function runExclusive(rawSymbol, task) {
+  const key = String(rawSymbol || '(unscoped)').toUpperCase();
+  const previous = instrumentLocks.get(key) || Promise.resolve();
+  const run = previous.then(task, task);
+  instrumentLocks.set(key, run.catch(() => {})); // never let a rejection wedge the chain
+  return run;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -997,9 +1028,9 @@ const server = http.createServer(async (req, res) => {
   const hasType = payload.type !== undefined && payload.type !== null && payload.type !== '';
   const shouldOpenTrade = isTradePath && hasType;
   const shouldClosePositions = isClosePath || (isTradePath && !hasType);
+  const requestSymbol = payload.symbol ?? payload.Symbol ?? payload.ticker ?? payload.Ticker;
 
   if (shouldOpenTrade || shouldClosePositions) {
-    const requestSymbol = payload.symbol ?? payload.Symbol ?? payload.ticker ?? payload.Ticker;
     const intent = shouldOpenTrade ? `OPEN ${String(payload.type).toUpperCase()}` : 'CLOSE';
     if (shouldClosePositions && !requestSymbol) {
       log(`WARNING: ${intent} request on ${requestPath} has no "symbol" field — this will close ALL open positions account-wide, not one instrument. Symbol: (none)`);
@@ -1028,86 +1059,91 @@ const server = http.createServer(async (req, res) => {
   // TradeLocker Order Execution Endpoint
   // -------------------------------------------------------------------
   } else if (shouldOpenTrade) {
-    try {
-      const tradeResult = await createTradeLockerTrade(payload);
-      const isDry = tradeResult.dryRun;
-      
-      log(`TradeLocker order ${isDry ? 'simulated (DRY RUN)' : 'created'} successfully: ${JSON.stringify(tradeResult)}`);
+    // Ack immediately — TradingView only needs a prompt 200 to consider this
+    // delivered. The full TradeLocker/Telegram round-trip (up to 8 sequential
+    // outbound calls) used to run before responding; if TradingView's own
+    // delivery timeout was shorter than that chain, or a call in it was slow
+    // or rate-limited, the late/failed response triggered a TradingView retry
+    // — which is what piled duplicate open/close requests on top of each
+    // other in the 2026-08-11 incident. Failures are still reported (via the
+    // Telegram alert below), just not via the HTTP status anymore.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ACCEPTED' }));
 
-      const telegramText = [
-        isDry ? '🧪 TradeLocker Trade (DRY RUN - SIMULATED)' : '⚡ TradeLocker Trade Executed',
-        `Order ID: ${tradeResult.orderId}`,
-        `Symbol: ${tradeResult.instrumentName}`,
-        `Side: ${tradeResult.side.toUpperCase()}`,
-        `Type: ${tradeResult.type.toUpperCase()}`,
-        `Quantity: ${tradeResult.qty}`,
-        `Entry: ${tradeResult.entry}`,
-        `Take Profit: ${tradeResult.tp}`,
-        `Stop Loss: ${tradeResult.sl}`
-      ].join('\n');
-
+    runExclusive(requestSymbol, async () => {
       try {
-        await sendTelegramMessage(telegramText);
-        log(`Trade execution alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
-      } catch (tgErr) {
-        log(`Failed to send trade execution alert to Telegram: ${tgErr.message}`);
+        const tradeResult = await createTradeLockerTrade(payload);
+        const isDry = tradeResult.dryRun;
+
+        log(`TradeLocker order ${isDry ? 'simulated (DRY RUN)' : 'created'} successfully: ${JSON.stringify(tradeResult)}`);
+
+        const telegramText = [
+          isDry ? '🧪 TradeLocker Trade (DRY RUN - SIMULATED)' : '⚡ TradeLocker Trade Executed',
+          `Order ID: ${tradeResult.orderId}`,
+          `Symbol: ${tradeResult.instrumentName}`,
+          `Side: ${tradeResult.side.toUpperCase()}`,
+          `Type: ${tradeResult.type.toUpperCase()}`,
+          `Quantity: ${tradeResult.qty}`,
+          `Entry: ${tradeResult.entry}`,
+          `Take Profit: ${tradeResult.tp}`,
+          `Stop Loss: ${tradeResult.sl}`
+        ].join('\n');
+
+        try {
+          await sendTelegramMessage(telegramText);
+          log(`Trade execution alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
+        } catch (tgErr) {
+          log(`Failed to send trade execution alert to Telegram: ${tgErr.message}`);
+        }
+
+        try {
+          await sendTelegramMessageWithButton(
+            `Kill switch for ${tradeResult.instrumentName}`,
+            `🔴 Close ${tradeResult.instrumentName}`,
+            `close:${tradeResult.instrumentName}`
+          );
+          startTelegramPollingSession(); // fire-and-forget; no-op if a session is already active
+        } catch (tgErr) {
+          log(`Failed to send close-trade button to Telegram: ${tgErr.message}`);
+        }
+      } catch (err) {
+        log(`Trade creation failed: ${err.message}`);
+
+        try {
+          await sendTelegramMessage(`❌ Trade Execution FAILED\nSymbol: ${payload.symbol || payload.ticker || 'Unknown'}\nError: ${err.message}`);
+        } catch (_) {}
       }
-
-      try {
-        await sendTelegramMessageWithButton(
-          `Kill switch for ${tradeResult.instrumentName}`,
-          `🔴 Close ${tradeResult.instrumentName}`,
-          `close:${tradeResult.instrumentName}`
-        );
-        startTelegramPollingSession(); // fire-and-forget; no-op if a session is already active
-      } catch (tgErr) {
-        log(`Failed to send close-trade button to Telegram: ${tgErr.message}`);
-      }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'OK', orderId: tradeResult.orderId, details: tradeResult }));
-    } catch (err) {
-      log(`Trade creation failed: ${err.message}`);
-
-      try {
-        await sendTelegramMessage(`❌ Trade Execution FAILED\nSymbol: ${payload.symbol || payload.ticker || 'Unknown'}\nError: ${err.message}`);
-      } catch (_) {}
-
-      res.writeHead(502, { 'Content-Type': 'text/plain' });
-      res.end(`Trade creation failed: ${err.message}`);
-    }
+    });
   // -------------------------------------------------------------------
   // TradeLocker Close Position Endpoint
   // -------------------------------------------------------------------
   } else if (shouldClosePositions) {
-    try {
-      const closeSymbol = payload.symbol ?? payload.Symbol ?? payload.ticker ?? payload.Ticker;
-      const closed = await closeAllTradeLockerPositions(closeSymbol);
-      log(`Closed ${closed.length} TradeLocker position(s)${closeSymbol ? ` for ${closeSymbol}` : ''}: ${JSON.stringify(closed)}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ACCEPTED' }));
 
-      const telegramText = closed.length > 0
-        ? ['🔒 TradeLocker Position(s) Closed', ...closed.map(formatClosedPositionLine)].join('\n')
-        : `ℹ️ Close called${closeSymbol ? ` for ${closeSymbol}` : ''} — no open position to close`;
-
+    runExclusive(requestSymbol, async () => {
       try {
-        await sendTelegramMessage(telegramText);
-        log(`Close alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
-      } catch (tgErr) {
-        log(`Failed to send close alert to Telegram: ${tgErr.message}`);
+        const closed = await closeAllTradeLockerPositions(requestSymbol);
+        log(`Closed ${closed.length} TradeLocker position(s)${requestSymbol ? ` for ${requestSymbol}` : ''}: ${JSON.stringify(closed)}`);
+
+        const telegramText = closed.length > 0
+          ? ['🔒 TradeLocker Position(s) Closed', ...closed.map(formatClosedPositionLine)].join('\n')
+          : `ℹ️ Close called${requestSymbol ? ` for ${requestSymbol}` : ''} — no open position to close`;
+
+        try {
+          await sendTelegramMessage(telegramText);
+          log(`Close alert sent to Telegram: ${telegramText.replace(/\n/g, ' | ')}`);
+        } catch (tgErr) {
+          log(`Failed to send close alert to Telegram: ${tgErr.message}`);
+        }
+      } catch (err) {
+        log(`Position close failed: ${err.message}`);
+
+        try {
+          await sendTelegramMessage(`❌ Position Close FAILED\nError: ${err.message}`);
+        } catch (_) {}
       }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'OK', closed }));
-    } catch (err) {
-      log(`Position close failed: ${err.message}`);
-
-      try {
-        await sendTelegramMessage(`❌ Position Close FAILED\nError: ${err.message}`);
-      } catch (_) {}
-
-      res.writeHead(502, { 'Content-Type': 'text/plain' });
-      res.end(`Position close failed: ${err.message}`);
-    }
+    });
   }
 });
 
