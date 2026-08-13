@@ -26,10 +26,60 @@ const path = require('path');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const LOG_PATH = path.join(__dirname, 'webhook.log');
 
+// When the same message repeats back-to-back (e.g. the idle reconciliation
+// check firing every 15 minutes), the previous line is rewritten in place
+// with a repeat counter instead of appending a new, identical line each
+// time. Requires knowing the exact byte offset of that line, so — unlike
+// the original fire-and-forget appendFile — these writes are synchronous;
+// Node is single-threaded and log() never awaits, so there's no risk of
+// another write interleaving mid-update. Log volume is low (and now lower
+// because of this very feature), so the sync I/O cost is negligible.
+let lastLogMessage = null;
+let lastLogMessageFirstSeen = null; // timestamp of the first line in the current repeat streak
+let lastLogLineStart = null; // byte offset in LOG_PATH where the last line begins
+let lastLogLineEnd = null;   // byte offset where the last line ends (== file size, if untouched since)
+let lastLogRepeatCount = 0;
+
 function log(msg) {
-  const line = `[${new Date().toISOString()}] ${msg}`;
+  const timestamp = new Date().toISOString();
+
+  if (msg === lastLogMessage && lastLogLineStart !== null) {
+    let currentSize;
+    try { currentSize = fs.statSync(LOG_PATH).size; } catch (_) { currentSize = null; }
+
+    if (currentSize === lastLogLineEnd) {
+      lastLogRepeatCount++;
+      const line = `[${timestamp}] ${msg} (repeated ${lastLogRepeatCount + 1}x, first at ${lastLogMessageFirstSeen})`;
+      console.log(line);
+      try {
+        const buf = Buffer.from(line + '\n', 'utf8');
+        const fd = fs.openSync(LOG_PATH, 'r+');
+        fs.ftruncateSync(fd, lastLogLineStart);
+        fs.writeSync(fd, buf, 0, buf.length, lastLogLineStart);
+        fs.closeSync(fd);
+        lastLogLineEnd = lastLogLineStart + buf.length;
+      } catch (_) { /* best-effort logging only */ }
+      return;
+    }
+    // File size doesn't match what we last wrote (rotated/edited outside
+    // this process) — fall through and start a fresh line rather than risk
+    // truncating at a now-stale offset.
+  }
+
+  const line = `[${timestamp}] ${msg}`;
   console.log(line);
-  fs.appendFile(LOG_PATH, line + '\n', () => {}); // best-effort, non-blocking
+  lastLogMessage = msg;
+  lastLogMessageFirstSeen = timestamp;
+  lastLogRepeatCount = 0;
+  try {
+    const sizeBefore = fs.existsSync(LOG_PATH) ? fs.statSync(LOG_PATH).size : 0;
+    fs.appendFileSync(LOG_PATH, line + '\n');
+    lastLogLineStart = sizeBefore;
+    lastLogLineEnd = sizeBefore + Buffer.byteLength(line + '\n', 'utf8');
+  } catch (_) {
+    lastLogLineStart = null;
+    lastLogLineEnd = null;
+  }
 }
 
 function loadConfig() {
